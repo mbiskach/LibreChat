@@ -3,11 +3,140 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v8 — closes the null-origin networking contradiction,
-binds approval to a canonical launch manifest, retires the legacy
-permissive renderer when Apps are enabled, adds concrete
-operational limits, nails down content decoding, and folds the
-relay probe into `ui/initialize` after the seventh review:
+**Revision:** v9 — restructures the implementation strategy to
+adopt upstream PR #11799 and the `dev`-branch transport fixes
+rather than parallel-build, splits Apps into a Preview track
+and a Hardened GA track, narrows the first Apps release to
+live chat only, defers full-conversation remount out of the
+critical path, and trims Tasks v1 to status-first after the
+eighth review:
+
+- **Adopt-then-layer, not parallel-build.** Earlier revisions
+  framed this plan as a from-scratch Apps implementation that
+  happened to live near upstream. v9 explicitly inherits
+  upstream [PR #11799](https://github.com/danny-avila/LibreChat/pull/11799)
+  (`feat: MCP Apps Extension Support`) as the substrate and
+  layers the v8 security/hardening delta on top. Several
+  items the plan had been treating as differentiators are
+  already implemented upstream and become regression-test
+  concerns rather than greenfield work:
+  - Per-instance outer iframes (`MCPAppContainer` already
+    renders one outer iframe per app instance).
+  - Same-server binding for forwarded MCP methods (the
+    bridge already binds `tools/call` and `resources/read`
+    to the instance's stored `serverName`; a single shared
+    ACL function is now a refactor, not a new capability).
+  - Backend sandbox endpoint authentication and
+    `appsEnabled` gating for `/api/mcp/sandbox`.
+  - `ui://` URI validation for `resources/read`.
+  - Capability advertising disabled when
+    `mcpSettings.apps` is off.
+  - `mcp_app` artifact + metadata propagation through tool
+    definitions.
+  - An Apps test server scaffold for interop coverage.
+  - `stableMCPAppRef` for parent-re-render survival in
+    active chat.
+
+  These are listed in the Upstream context section as
+  **inherited; verify with regression tests** rather than as
+  intentional divergences.
+
+- **Apps Preview track + Hardened GA track.** v9 acknowledges
+  that the v8 hardening model (dedicated
+  `MCP_SANDBOX_ORIGIN`, hop-specific relay validation,
+  proxy-stamped nonce, manifest-hash approval, self-contained
+  HTML, `connect-src 'none'`, retired legacy renderer) is
+  expensive on purpose. To avoid blocking any user-visible
+  shipping on all of it at once, v9 splits Apps phasing into
+  two named tracks:
+  - **Apps Preview** (Phase 2P): adopt #11799 substantially
+    as-is — `mcp_app` artifacts, backend proxies,
+    per-instance chat rendering, the branch-native config
+    (`allowedConnectDomains`, `blockedDomains`, `maxHeight`,
+    `allowFullscreen`), the existing bridge/sandbox flow
+    behind `mcpSettings.apps` and a new
+    `MCP_APPS_PREVIEW_ENABLED` flag. Inline display only,
+    chat surface only. No new approval store. No
+    `MCP_SANDBOX_ORIGIN`. The legacy `UIResourceRenderer`
+    keeps running on share/search/plugin surfaces during
+    Preview.
+  - **Apps Hardened GA** (Phase 2H, follow-up release):
+    layer the v8 security delta on top of Preview —
+    dedicated `MCP_SANDBOX_ORIGIN`, explicit-target-origin
+    transport, hop-specific validation + proxy-stamped
+    nonce, folded-in `ui/initialize` probe,
+    `connect-src 'none'`, self-contained-HTML rule,
+    `MCPAppLaunchManifest` + `manifestHash` review,
+    `MCPAppInstance` remount persistence, full retirement
+    of `UIResourceRenderer` across all surfaces, `ui://`
+    domain still rejected, `prefersBorder` still ignored,
+    operational limits enforced. Gated behind
+    `MCP_APPS_HARDENED_ENABLED`.
+  This is a real product trade — Preview ships earlier with
+  weaker guarantees — and v9 names it explicitly rather than
+  hiding it inside "implementation detail."
+
+- **First Apps release narrows to live chat only.** Upstream
+  Apps code lives under
+  `client/src/components/Chat/Messages/Content/MCPApp/`,
+  while `MCPUIResource` is the generic component used by
+  share, search, and plugin-rendered messages. v9 makes it a
+  hard rule that share, search, and plugin surfaces fall
+  back to **text rendering** when an MCP UI resource
+  appears, both during Preview and at Hardened GA. Cross-
+  surface support is a post-Hardened-GA increment. This cuts
+  the audit + test matrix significantly and removes a class
+  of "what does this view look like in share?" coupling.
+
+- **`MCPAppInstance` remount persistence moves out of the
+  critical path.** Upstream's `stableMCPAppRef` already
+  preserves the most common active-chat use case (parent
+  re-render does not reset the app). Full-conversation
+  remount after refresh — DB-backed, `manifestHash`-pinned,
+  divergence-aware — is now a Hardened GA item, not Preview.
+  This avoids dragging schema, approval coupling, and
+  rehydration logic into the first user-visible release.
+
+- **Tasks v1 trimmed to status-first.** Since there is no
+  upstream Tasks WIP to inherit, Phase 4's surface area
+  contracts to: per-tool `taskSupport` honoring,
+  active-subscriber polling, status-only jobs panel,
+  explicit detail / wait-for-result, cancel,
+  `authContextHash` ownership, TTL-bounded cache,
+  outstanding-task revalidation on 404. Progress bars and
+  richer placeholder UI are deferred until upstream
+  [PR #12535](https://github.com/danny-avila/LibreChat/pull/12535)
+  (real-time `notifications/progress`) lands; reuse it
+  rather than rebuild. `model-immediate-response` stays in
+  Phase 4 because it is independent of progress UI.
+
+- **Phase 0 inherits the `dev` transport fixes.**
+  Implementation starts from `dev`, not the older `main`
+  HEAD. Phase 0 inherits PR #12850 (307/308 + credential
+  stripping + SSRF), PR #12853 (idle-check trigger), and
+  PR #12910 (tool-cache lookup hardening). Phase 0
+  plan-original work (session reuse, header consistency,
+  basic 404 → re-init, per-user token scoping,
+  `authContextHash`, operator policy defaults) stays.
+
+- **Fullscreen decided.** Upstream #11799 already implements
+  fullscreen request handling and a fullscreen portal UI
+  (`allowFullscreen`, fullscreen iframe). Earlier revisions
+  said v1 was inline-only. v9 **accepts upstream fullscreen
+  in Preview** behind a per-server operator setting
+  (default OFF), and revisits in Hardened GA against the
+  same trust-chrome rules (mandatory border + identity
+  chrome must be visible even in fullscreen). Stripping it
+  from the delta is more work than gating it.
+
+- **Refactor delta vs replacement delta.** v9 distinguishes
+  refactor work (e.g. wrap the existing per-instance same-
+  server binding into a single `forwardMcpRequestFromView`
+  ACL function) from replacement work (e.g. swap the data
+  URL outer iframe for a dedicated-origin proxy). The
+  former is cheap and lands during Preview as cleanup; the
+  latter is Hardened GA. Items are tagged in the phase
+  bullets to make the difference obvious.
 
 - **No direct browser networking in v1.** With the inner iframe
   sandboxed without `allow-same-origin`, the browser serializes
@@ -311,41 +440,60 @@ relay probe into `ui/initialize` after the seventh review:
   `size-changed`, configurable cap) and an opt-out for aggressive
   shrink-wrap.
 
-Carried forward (still in force):
+Carried forward (still in force, with track-tags):
 
-- Cancellation after terminal returns `-32602` invalid params.
-- `input_required` preserves server status; host marks
-  `hostHandlingState = "unsupported_lifecycle"`; no fake `failed`
-  envelope.
-- Active-subscriber polling only; no API-process background
-  poller; no durable subscriber registry.
-- `_meta.ui.domain` unsupported in v1; single `MCP_SANDBOX_ORIGIN`.
-- Self-contained HTML only; v1 approves bytes, not origins.
-- PostMessage transport wrapper around `AppBridge` sends to
-  explicit target origins; preserves SDK receive validation.
-- Iframe sandbox hardened defaults; `ui/open-link` is the only
-  navigation escape hatch.
-- Hop-specific relay validation; host rejects `null` origin;
-  proxy-stamped per-view nonce.
-- Single ACL for all forwarded MCP methods; cross-server
-  forwarding impossible by construction.
-- Resource fetch/hash/review is server-side; browser receives
-  already-approved payloads (genuinely true under the
-  self-contained-HTML rule, and now extended to a launch
-  manifest).
-- `ui/message` is `user`-only per generated stable schema.
-- CAD example persists artifact handle, not presigned URL.
-- Independent feature flags: `MCP_APPS_ENABLED`,
-  `MCP_TASKS_ENABLED`.
-- One outer sandbox proxy iframe per app instance; no pooling.
-- Host construction-order invariant.
-- Model-path vs view-path data boundary; `_meta` preserved on
-  the view path.
-- Status-only jobs panel; `tasks/result` on detail entry or
-  explicit wait — nothing else.
-- Lazy-loaded `AppBridge` runtime on the client.
-- Sizing fallback height + `shrinkWrap: false` opt-out.
-- `MCPAppInstance` artifact for remount; not a state store.
+Legend: **[P]** = Apps Preview track. **[H]** = Apps Hardened
+GA track. **[T]** = Tasks track. **[A]** = applies to all.
+
+- **[T]** Cancellation after terminal returns `-32602` invalid
+  params.
+- **[T]** `input_required` preserves server status; host marks
+  `hostHandlingState = "unsupported_lifecycle"`; no fake
+  `failed` envelope.
+- **[T]** Active-subscriber polling only; no API-process
+  background poller; no durable subscriber registry.
+- **[H]** `_meta.ui.domain` unsupported; single
+  `MCP_SANDBOX_ORIGIN`. (Preview keeps the upstream `data:`-URL
+  outer iframe.)
+- **[H]** Self-contained HTML only; approves bytes, not
+  origins. (Preview honors upstream
+  `allowedConnectDomains` / `blockedDomains` model.)
+- **[H]** PostMessage transport wrapper around `AppBridge`
+  sends to explicit target origins; preserves SDK receive
+  validation. (Preview keeps the upstream `'*'` send.)
+- **[A]** Iframe sandbox hardened defaults at the inner frame;
+  `ui/open-link` is the only navigation escape hatch.
+- **[H]** Hop-specific relay validation; host rejects `null`
+  origin; proxy-stamped per-view nonce.
+- **[H]** Single ACL function for all forwarded MCP methods.
+  (Preview already gets same-server binding via per-instance
+  `serverName`; the consolidation is a refactor.)
+- **[H]** Resource fetch / decode / manifest / hash / review
+  is server-side; browser receives already-approved payloads.
+- **[A]** `ui/message` is `user`-only per generated stable schema.
+- **[A]** CAD example persists artifact handle, not presigned
+  URL.
+- **[A]** Independent feature flags: `MCP_APPS_PREVIEW_ENABLED`,
+  `MCP_APPS_HARDENED_ENABLED`, `MCP_TASKS_ENABLED`. (`MCP_APPS_ENABLED`
+  from earlier revisions is **superseded** by the two-flag
+  split; keep the old name as an alias that sets Preview only,
+  with a deprecation note.)
+- **[A]** One outer sandbox proxy iframe per app instance; no
+  pooling. (Already true upstream; verified in Preview, kept
+  in Hardened GA.)
+- **[A]** Host construction-order invariant.
+- **[A]** Model-path vs view-path data boundary; `_meta`
+  preserved on the view path.
+- **[T]** Status-only jobs panel; `tasks/result` on detail
+  entry or explicit wait — nothing else. Progress UI deferred
+  to upstream PR #12535 reuse.
+- **[A]** Lazy-loaded `AppBridge` runtime on the client.
+- **[A]** Sizing fallback height + `shrinkWrap: false` opt-out.
+  (Preview also accepts upstream `maxHeight`.)
+- **[H]** `MCPAppInstance` artifact for full-conversation
+  remount; not a state store. (Preview relies on
+  `stableMCPAppRef` for parent-re-render survival; full
+  remount is Hardened GA.)
 - Local task-result cache bounded by `createdAt + ttl`;
   `MCPTask` is a cache, not durable storage.
 - Tasks-only over Streamable HTTP.
@@ -463,11 +611,30 @@ Tasks v1.
      forwarding to the host. The app never sees the nonce.
    Mixing the rules across hops was the v6 looseness; v7 keeps
    them separate.
-10. **Apps and Tasks release behind separate feature flags.**
-    `MCP_APPS_ENABLED` and `MCP_TASKS_ENABLED` are independent.
-    Apps may turn on without Tasks; Tasks may stay off through
-    multiple Apps minor releases. This keeps the experimental
-    Tasks spec from blocking the stable Apps user experience.
+10. **Apps and Tasks release behind separate feature flags;
+    Apps splits into Preview and Hardened GA flags.**
+    Three independent flags:
+    - `MCP_APPS_PREVIEW_ENABLED` — adopts upstream PR #11799
+      substantially as-is (per-instance chat rendering,
+      `mcp_app` artifacts, backend proxies, branch-native
+      config). Live chat surface only. Inline plus optional
+      fullscreen behind `appSettings.allowFullscreen`. The
+      legacy `UIResourceRenderer` continues to render UI
+      resources on share/search/plugin surfaces during
+      Preview.
+    - `MCP_APPS_HARDENED_ENABLED` — turns on the v8 security
+      delta. Implies Preview is on. Adds dedicated
+      `MCP_SANDBOX_ORIGIN`, hop-specific relay validation
+      with proxy-stamped nonce, folded-in `ui/initialize`
+      probe, `connect-src 'none'`, self-contained-HTML rule,
+      `MCPAppLaunchManifest` review, full retirement of
+      `UIResourceRenderer` across all surfaces, mandatory
+      trust chrome ignoring `prefersBorder=false`.
+    - `MCP_TASKS_ENABLED` — independent of both Apps flags.
+    Earlier-revision `MCP_APPS_ENABLED` is **deprecated**;
+    it is kept as an alias mapping to
+    `MCP_APPS_PREVIEW_ENABLED=true` only, with a deprecation
+    warning at server start.
 11. **One outer sandbox proxy iframe per app instance.** No
     pooling, no multiplexing in v1. Routing, teardown, audit,
     source pinning, and failure handling all simplify; no
@@ -496,20 +663,26 @@ Tasks v1.
     locally cached `tasks/result` payload expires no later
     than `createdAt + ttl` as reported by the server.
     Persistence beyond upstream TTL is post-v1.
-15. **Legacy `UIResourceRenderer` path is gated, not bypassed.**
-    When `MCP_APPS_ENABLED=true`, the existing
-    `client/src/components/MCPUIResource/MCPUIResource.tsx`
-    path (and any other surface that mounts
-    `@mcp-ui/client`'s `UIResourceRenderer`) is **disabled
-    everywhere it can render** — chat, share, search,
-    plugin-rendered messages. Tools with
-    `_meta.ui.resourceUri` route through the new Apps path;
-    other UI resources fall back to text. When
-    `MCP_APPS_ENABLED=false`, the legacy path stays as
-    today, but its `sandboxPermissions` default is changed
-    from `'allow-popups'` to `''` and a chrome banner points
-    operators at the migration. There is no mode where both
-    paths render the same message.
+15. **Legacy `UIResourceRenderer` path retirement is staged
+    by track.**
+    - **Preview** (`MCP_APPS_PREVIEW_ENABLED=true`,
+      `MCP_APPS_HARDENED_ENABLED=false`): the new Apps path
+      handles **chat surface only**. The legacy renderer
+      continues to render UI resources on share, search,
+      and plugin-rendered surfaces. Its default
+      `sandboxPermissions` is changed from
+      `'allow-popups'` to `''` (deny by default). A chrome
+      banner notes the migration.
+    - **Hardened GA** (`MCP_APPS_HARDENED_ENABLED=true`):
+      the legacy renderer is **disabled everywhere it can
+      render** — chat, share, search, plugin-rendered. Tools
+      with `_meta.ui.resourceUri` route through the new Apps
+      path; other UI resources fall back to text. There is
+      no mode where both paths render the same message.
+    - **Disabled** (both flags off): same as today's `main`,
+      but with the deny-default `sandboxPermissions` change
+      applied. This is the safety net for operators not
+      ready to opt in.
 16. **Outer-proxy vs inner-iframe sandbox split.** The outer
     sandbox-proxy iframe (loads `proxy.html` from
     `MCP_SANDBOX_ORIGIN`) runs with
@@ -543,6 +716,36 @@ Tasks v1.
     `null` so the hash distinguishes "absent" from
     "empty". The function lives in `packages/api` and has
     a dedicated unit-test corpus.
+19. **Adopt upstream PR #11799 + `dev` transport fixes as
+    the substrate, then layer the v8 hardening delta.**
+    Implementation does not parallel-build. Phase 0 starts
+    from `dev` (inheriting PRs #12850, #12853, #12910).
+    Phase 2P (Apps Preview) inherits #11799 substantially
+    as-is and adds the live-chat narrowing and the
+    deny-default `sandboxPermissions` legacy change.
+    Phase 2H (Apps Hardened GA) layers the v8 security
+    delta on top. Items already implemented upstream
+    (per-instance outer iframes, same-server binding via
+    instance state, `/api/mcp/sandbox` auth + `appsEnabled`
+    gating, `ui://` URI validation, capability advertising
+    gating, `mcp_app` artifact plumbing,
+    `stableMCPAppRef`) are **inherited; verify with
+    regression tests** rather than re-implemented.
+20. **First Apps release (Preview and Hardened GA both)
+    is live-chat-only.** Share, search, and plugin-
+    rendered surfaces fall back to text rendering even
+    after Hardened GA. Cross-surface support is a
+    post-Hardened-GA increment. This rule applies even
+    when both flags are on; opting in does not unlock
+    other surfaces.
+21. **Fullscreen accepted in Preview behind operator
+    gate.** Upstream #11799 already implements
+    `appSettings.allowFullscreen` and the fullscreen
+    portal. v9 keeps this code; fullscreen is OFF by
+    default per server. Hardened GA re-validates trust
+    chrome rules under fullscreen (mandatory border +
+    identity chrome must remain visible). Other display
+    modes (`pip`, etc.) remain out of scope.
 
 ## Pinned protocol versions
 
@@ -802,16 +1005,15 @@ Reference:
 
 ## Upstream context and related work
 
-This plan does not exist in a vacuum. The following upstream
-LibreChat artifacts (`danny-avila/LibreChat`) overlap with or
-adjacent-to this scope and should be tracked alongside it.
+This plan adopts upstream LibreChat work where it exists and
+layers the v8 hardening delta on top. It does not parallel-build.
 
-### Direct overlap — MCP Apps
+### Direct overlap — MCP Apps (substrate to inherit)
 
 - **PR [#11799](https://github.com/danny-avila/LibreChat/pull/11799)
   — `feat: MCP Apps Extension Support`** (open, branch
-  `KyleKincer:feat/mcp-apps`). Implements the same
-  `io.modelcontextprotocol/ui` capability this plan targets:
+  `KyleKincer:feat/mcp-apps`). Implements the
+  `io.modelcontextprotocol/ui` substrate end-to-end:
   `_meta.ui.resourceUri` discovery through tool definitions, a
   two-layer sandboxed iframe at
   `client/public/mcp-sandbox.html`, a JSON-RPC bridge
@@ -820,59 +1022,93 @@ adjacent-to this scope and should be tracked alongside it.
   artifact attachment, backend proxies at
   `/api/mcp/{resources/read, app-tool-call, sandbox}`,
   `mcpSettings.apps` / `appSettings` configuration, dynamic
-  CSP synthesis, and a `modelTools` vs `allTools` visibility
-  split.
+  CSP synthesis from `connectDomains` / `resourceDomains` /
+  `frameDomains` / `baseUriDomains`, fullscreen handling, and
+  a `modelTools` vs `allTools` visibility split.
 - **Issue [#10641](https://github.com/danny-avila/LibreChat/issues/10641)
   — `Enhancement: Support for MCP Apps`** (open). The
   long-standing tracking issue that #11799 implements against.
 
-**This plan diverges from #11799 on the following axes**, and
-those divergences are intentional rather than re-implementations
-of work already in flight:
+#### Inherited from #11799 (regression-test only, not re-implemented)
+
+These items the plan previously listed as differentiators are
+already implemented in the upstream branch. v9 does not
+re-implement them; Phase 2P relies on them and Phase 1 covers
+them with regression tests:
+
+- Per-instance outer iframes (`MCPAppContainer` already renders
+  one outer iframe per app, with its own `sandboxSrc` derived
+  from the `/api/mcp/sandbox` template).
+- Same-server binding for forwarded MCP methods. The bridge
+  binds `tools/call` and `resources/read` to the instance's
+  stored `serverName`. v9's "single shared ACL" is a
+  consolidation refactor (Phase 2P), not a new capability.
+- `/api/mcp/sandbox` endpoint authentication and `appsEnabled`
+  gating.
+- `ui://` URI validation for `resources/read` requests
+  forwarded from views.
+- Capability advertising disabled when `mcpSettings.apps` is
+  off, threaded through connection construction.
+- `mcp_app` artifact + metadata propagation through tool
+  definitions (`_meta.ui.resourceUri`).
+- An Apps test server scaffold for interop coverage.
+- `stableMCPAppRef` to preserve app state across parent
+  re-renders during active chat.
+
+#### Hardening delta layered on top of #11799 (Phase 2H, intentional)
+
+These items are the ones #11799 does **not** cover and that v8's
+security thesis still requires. They become Hardened GA work
+rather than parallel implementation:
 
 1. **Self-contained HTML only.** #11799 allows external assets
-   via `resourceDomains`-driven CSP. v8 cuts external assets
-   entirely so approval can bind to bytes (see
+   via `resourceDomains`-driven CSP. Hardened GA cuts external
+   assets entirely so approval can bind to bytes (see
    `manifestHash`).
 2. **No direct browser networking.** #11799 honors
-   `connectDomains` and lets the view `fetch` directly. v8
-   sets `connect-src 'none'` and routes everything through
-   `tools/call` / `resources/read` / `ui/open-link` because
-   the `null` inner-frame origin makes credentialed browser
-   networking unreliable.
-3. **One proxy iframe per app instance, not one shared
-   sandbox.** #11799 mounts a single `mcp-sandbox.html` and
-   multiplexes view lifecycle through it. v8 spawns one outer
-   proxy iframe per rendered app instance to keep teardown,
-   audit, and source pinning trivial.
+   `connectDomains` and lets the view `fetch` directly.
+   Hardened GA sets `connect-src 'none'` and routes everything
+   through `tools/call` / `resources/read` / `ui/open-link`
+   because the `null` inner-frame origin makes credentialed
+   browser networking unreliable.
+3. **Dedicated `MCP_SANDBOX_ORIGIN`.** #11799 fetches the
+   sandbox template from `'/api/mcp/sandbox'` on the
+   application origin and converts the HTML to a `data:` URL
+   for the outer iframe. Hardened GA replaces this with a
+   different-origin static `proxy.html` served from
+   `MCP_SANDBOX_ORIGIN`, with `frame-ancestors` enforced via
+   response header.
 4. **Hop-specific relay validation with proxy-stamped per-view
-   nonce.** #11799 uses standard `event.source` checks; v8
-   adds the nonce to survive WebKit/Safari's relay
-   `event.source === window` quirk and rejects `null` origin
-   at the host hop entirely.
+   nonce.** #11799 validates inbound primarily by
+   `event.source`; the custom bridge sends with
+   `postMessage(..., '*')`. Hardened GA wraps `AppBridge` with
+   an explicit-target-origin transport and adds the
+   proxy-stamped nonce so trust does not depend on
+   `event.source` alone (this is the WebKit/Safari relay
+   bug fix path).
 5. **Approval over a launch manifest, not just HTML hash.**
-   v8 binds review and remount to a canonical manifest
-   covering sandbox flags, permissions, network policy, URI,
-   and trust-policy version, so policy drift forces
-   re-approval.
+   #11799 has no review/approval store at all. Hardened GA
+   binds review and remount to `manifestHash` covering
+   sandbox flags, permissions, network policy, URI, and
+   trust-policy version.
 6. **Construction-order invariant** explicit and tested as a
-   Phase 1 exit criterion (the upstream `srcdoc` race
+   Hardened-GA exit criterion (the upstream `srcdoc` race
    discussion and PR #543 in `modelcontextprotocol/ext-apps`).
 7. **Trust chrome mandatory; `prefersBorder=false` ignored.**
-8. **Legacy `MCPUIResource` / `UIResourceRenderer` path
-   binary-gated**, including chat, share, search, and
-   plugin-rendered surfaces. #11799 introduces the new path
-   alongside the legacy renderer; v8 makes the migration
-   explicit and exclusive.
-9. **Operational limits and rate limits with concrete defaults.**
+8. **Full retirement of `MCPUIResource` / `UIResourceRenderer`
+   across chat, share, search, and plugin-rendered surfaces.**
+   Preview only retires it on chat; Hardened GA finishes the
+   migration. There is no mode where both paths render the
+   same message at Hardened GA.
+9. **Operational limits and rate limits with concrete
+   defaults.**
 10. **Streamable HTTP–only Tasks support with
     `authContextHash` ownership binding** (separate scope from
     Apps; #11799 does not touch Tasks).
 
-If #11799 lands first in `main`, this plan should be reframed
-as an evolution of that branch rather than a parallel
-implementation. Any item already covered upstream becomes a
-regression-only test in this plan.
+If #11799 lands in `main` before Phase 2P starts, the plan
+treats it as a clean inheritance. If #11799 stalls upstream,
+Phase 2P cherry-picks it from the open PR.
 
 ### Direct overlap — MCP Tasks
 
@@ -881,11 +1117,15 @@ regression-only test in this plan.
   branch). Names the SEP-1686 use case (long-running tool
   calls without fixed timeouts) but does not enumerate
   `tasks/get` / `tasks/list` / `tasks/cancel` / `tasks/result`.
-  All Tasks work in this plan is greenfield against upstream;
-  cite #11997 as the open ask and the natural place to file
-  the eventual PR.
+  All Tasks control-plane work in this plan is greenfield
+  against upstream; cite #11997 as the open ask and the
+  natural place to file the eventual PR. Tasks does not
+  benefit from any upstream Apps WIP.
 
-### Adjacent — transport reliability
+### Adjacent — transport reliability (inherit from `dev`)
+
+Phase 0 starts from `dev`, not from the older `main` HEAD,
+specifically to inherit these:
 
 - **PR [#12850](https://github.com/danny-avila/LibreChat/pull/12850)
   — `fix: Follow 307/308 redirects in MCP streamable HTTP
@@ -895,20 +1135,32 @@ regression-only test in this plan.
   cross-origin credential stripping (`Authorization`,
   `Cookie`, `mcp-session-id`, configured server headers,
   `Proxy-Authorization`), SSRF revalidation per hop,
-  HTTPS→HTTP downgrade block. Phase 0 should track the merge
-  to `main`; if it stalls, port the work or fold its tests in.
+  HTTPS→HTTP downgrade block. **Inherited; Phase 0 adds
+  regression coverage only.** If implementation accidentally
+  starts from `main` HEAD, port these tests/code first.
 - **PR [#12853](https://github.com/danny-avila/LibreChat/pull/12853)
   — idle-check trigger fix** (merged Apr 29 2026, transport
-  hygiene).
+  hygiene). **Inherited.**
 - **PR [#12910](https://github.com/danny-avila/LibreChat/pull/12910)
   — MCP tool cache lookup failure handling** (merged May 2
-  2026, hygiene).
+  2026, hygiene). **Inherited.**
 - **Issue [#12802](https://github.com/danny-avila/LibreChat/issues/12802)
   — proactive MCP OAuth token refresh with per-user jitter**
-  (open, adjacent to per-user token scoping).
+  (open, adjacent to per-user token scoping). Track upstream
+  movement; if a PR lands, fold its progress into Phase 0's
+  per-user token-scoping closure.
+
+### Adjacent — Tasks UX reuse, not control plane
+
 - **PR [#12535](https://github.com/danny-avila/LibreChat/pull/12535)
-  — MCP progress notifications** (open, adjacent to the
-  long-running-Tasks UX surface).
+  — MCP progress notifications** (open). Adds real-time
+  `notifications/progress` rendering for tool-call cards over
+  SSE / streamable transports. Useful for the *presentation*
+  side of long-running operations. Does **not** implement
+  task creation, polling, wait-for-result, rehydration, TTL,
+  `authContextHash`, or 404 revalidation. v9 explicitly
+  defers Tasks v1 progress UI until #12535 lands and reuses
+  it; building progress UI is **not** a Phase 4 dependency.
 
 ### Adjacent — already in HEAD `738003b`
 
@@ -932,10 +1184,18 @@ There is **no** open PR or issue upstream covering:
 - Per-user header/token scoping for shared server
   definitions (the recent advisory).
 - Outstanding-task revalidation after a session re-init.
-- Replacement or retirement of the legacy
-  `MCPUIResource` / `UIResourceRenderer` path.
+- Cross-surface retirement of the legacy
+  `MCPUIResource` / `UIResourceRenderer` path (#11799 only
+  introduces the new path on the chat surface).
+- A dedicated `MCP_SANDBOX_ORIGIN` outer iframe (upstream
+  uses `data:` URL on the application origin).
+- A `manifestHash`-based review/approval store for resource
+  bytes + policy.
+- Hop-specific relay validation with proxy-stamped per-view
+  nonce.
 
-These remain plan-original work in Phase 0 and Phase 4.
+These remain plan-original work — Phase 0 (transport),
+Phase 2H (Hardened GA Apps), and Phase 4 (Tasks).
 
 ## Current state of LibreChat MCP integration
 
@@ -945,33 +1205,46 @@ These remain plan-original work in Phase 0 and Phase 4.
 | Tools, resources, prompts | Done (sampling/roots not impl.) | `packages/api/src/mcp/connection.ts` |
 | OAuth 2.0 + dynamic client registration + PKCE | Done | `packages/api/src/mcp/oauth/` |
 | MCP server management UI | Done | `client/src/components/SidePanel/MCPBuilder/` |
-| Sandboxed iframe UI rendering (mcp-ui ad-hoc, `allow-popups` default) | Done — to be retired/gated | `client/src/components/MCPUIResource/MCPUIResource.tsx` via `@mcp-ui/client` |
-| Cross-surface audit of `UIResourceRenderer` mounts (chat, share, search, plugin) | Phase 1 | client surfaces |
-| Default deny `sandboxPermissions` on legacy path when `MCP_APPS_ENABLED=false` | Phase 1 | legacy renderer |
+| Sandboxed iframe UI rendering (mcp-ui ad-hoc, `allow-popups` default) | Done — Preview retires on chat only, Hardened GA retires across all surfaces | `client/src/components/MCPUIResource/MCPUIResource.tsx` via `@mcp-ui/client` |
+| Default deny `sandboxPermissions` on legacy path | Phase 1 (applies even when both Apps flags off) | legacy renderer |
+| Cross-surface retirement of `UIResourceRenderer` (chat, share, search, plugin) | Phase 2H (Hardened GA) | client surfaces |
 | Sampling / elicitation | Missing | blocks `input_required` |
-| 307/308 redirect handling on Streamable HTTP | **Upstream PR #12850** (merged to `dev`, **not** in HEAD `738003b`) | transport layer |
-| Cross-origin credential stripping on redirects | **Upstream PR #12850** (same — in `dev`, not HEAD) | transport layer |
-| Streamable HTTP session reuse correctness, header consistency, 404 → re-init | Phase 0 (plan-original) | transport layer |
+| 307/308 redirect handling on Streamable HTTP | **Inherited from `dev` (PR #12850)** if implementation starts from `dev`; otherwise port | transport layer |
+| Cross-origin credential stripping on redirects | **Inherited from `dev` (PR #12850)** | transport layer |
+| Idle-check trigger fix on failed MCP connections | **Inherited from `dev` (PR #12853)** | transport layer |
+| MCP tool cache lookup failure handling | **Inherited from `dev` (PR #12910)** | transport layer |
+| Streamable HTTP session reuse correctness, header consistency, basic 404 → re-init | Phase 0 (plan-original) | transport layer |
 | Per-user header/token scoping (recent advisory) | Phase 0 (plan-original) | transport layer |
-| Apps capability negotiation (gated by `MCP_APPS_ENABLED`) | Missing | — |
-| `_meta.ui.resourceUri`-driven discovery (server-side) | Missing | — |
-| Cross-origin sandbox proxy + stable wire-format flow | Missing | — |
-| `AppBridge` wrapper with explicit-origin transport shim, lazy-loaded on client | Missing | — |
-| Host construction-order invariant for `srcdoc` race | Missing | — |
-| Hop-specific relay validation + proxy-stamped per-view nonce | Missing | — |
-| Runtime relay self-test + text-only fallback (no UA sniff) | Missing | — |
-| `ui/initialize` handshake + truthful `hostContext` (full surface) | Missing | — |
-| Single-ACL forwarded-method enforcement (incl. cross-server isolation) | Missing | — |
-| Self-contained-HTML validator (rejects all external assets, `<base>`) | Missing | — |
-| Content decoding pipeline (MIME, `text`/`blob`, UTF-8, multi-content reject) | Missing | — |
-| `MCPAppLaunchManifest` builder + canonical-JSON hasher (RFC 8785) | Missing | — |
-| First-launch resource review + manifest pinning (`MCPResourceReview.manifestHash`) | Missing | — |
-| `MCPAppInstance` artifact for remount (narrow, `manifestHash`-bound) | Missing | — |
-| Per-resource CSP via `<meta>` injection (strict; `connect-src 'none'`) | Missing | — |
-| Operational limits (HTML size, view-bound payload, teardown wait, rate limits, init timeout) | Missing | — |
-| `authContextHash` canonicalizer + unit-test corpus | Missing | `packages/api` |
-| Sizing fallback height + `shrinkWrap: false` opt-out | Missing | — |
-| Trust UX (sandbox boundary chrome) | Missing | — |
+| `_meta.ui.resourceUri`-driven discovery + tool-definition propagation | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| `mcp_app` artifact + metadata plumbing | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| Backend Apps proxies (`/api/mcp/{resources/read, app-tool-call, sandbox}`) | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| Per-instance outer iframe (`MCPAppContainer` with own `sandboxSrc`) | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| Same-server binding for forwarded methods (per-instance `serverName`) | **Inherited from #11799 (Phase 2P)**; consolidation refactor in Phase 2P | upstream branch |
+| `/api/mcp/sandbox` auth + `appsEnabled` gating | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| `ui://` URI validation for forwarded `resources/read` | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| Capability advertising disabled when `mcpSettings.apps` off | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| `stableMCPAppRef` for parent-re-render survival | **Inherited from #11799 (Phase 2P)** | upstream branch |
+| `appSettings.allowFullscreen` + fullscreen portal | **Inherited from #11799 (Phase 2P)**, OFF by default per server | upstream branch |
+| Apps test server scaffold | **Inherited from #11799** | upstream branch |
+| Apps Preview capability negotiation (gated by `MCP_APPS_PREVIEW_ENABLED`) | Phase 2P | — |
+| Live-chat-only narrowing (text fallback on share/search/plugin) | Phase 2P | client surfaces |
+| Single-ACL `forwardMcpRequestFromView` consolidation refactor | Phase 2P (refactor of inherited binding) | — |
+| Dedicated `MCP_SANDBOX_ORIGIN` outer iframe + `frame-ancestors` header | Phase 2H (Hardened GA) | — |
+| `AppBridge` wrapper with explicit-origin transport shim, lazy-loaded on client | Phase 2H (Hardened GA) | — |
+| Host construction-order invariant for `srcdoc` race | Phase 2H (Hardened GA) | — |
+| Hop-specific relay validation + proxy-stamped per-view nonce | Phase 2H (Hardened GA) | — |
+| Folded-in `ui/initialize` relay probe + text-only fallback | Phase 2H (Hardened GA) | — |
+| Truthful `hostContext` full surface (`toolInfo`, theme, locale, etc.) | Phase 2H (Hardened GA) | — |
+| Self-contained-HTML validator (rejects all external assets, `<base>`) | Phase 2H (Hardened GA) | — |
+| Content decoding pipeline (MIME, `text`/`blob`, UTF-8, multi-content reject) | Phase 2H (Hardened GA) | — |
+| `MCPAppLaunchManifest` builder + canonical-JSON hasher (RFC 8785) | Phase 2H (Hardened GA) | — |
+| First-launch resource review + manifest pinning (`MCPResourceReview.manifestHash`) | Phase 2H (Hardened GA) | — |
+| `MCPAppInstance` artifact for full-conversation remount | Phase 2H (Hardened GA) | — |
+| Per-resource CSP via `<meta>` injection (strict; `connect-src 'none'`) | Phase 2H (Hardened GA) | — |
+| Operational limits (HTML size, view-bound payload, teardown wait, rate limits, init timeout) | Phase 2H (Hardened GA) | — |
+| Trust UX (mandatory chrome; ignore `prefersBorder=false`) | Phase 2H (Hardened GA) | — |
+| `authContextHash` canonicalizer + unit-test corpus | Phase 0 (Tasks consumes it; Hardened GA also uses it) | `packages/api` |
+| Sizing fallback height + `shrinkWrap: false` opt-out | Phase 2P (alongside upstream `maxHeight`) | — |
 | MCP Tasks (per-tool negotiation, active-subscriber polling, single-path wait, `authContextHash` binding, TTL-bounded cache, semantic-equivalence rehydration) | Missing | — |
 | Tasks capability negotiation (gated by `MCP_TASKS_ENABLED`) | Missing | — |
 | `model-immediate-response` runtime behavior | Missing | — |
@@ -1631,173 +1904,253 @@ Phase 0 should therefore:
 
 ### Phase 0 — Transport reliability + auth-context substrate (≈3–5 days)
 
-- Session-reuse correctness across requests.
-- Consistent `MCP-Protocol-Version` / `MCP-Session-Id` headers.
+Implementation starts from `dev`, not `main` HEAD `738003b`,
+so several items are inherited rather than built. Work focuses
+on what `dev` does **not** cover.
+
+**Inherited from `dev` (regression coverage only):**
+
+- 307/308 redirect handling on Streamable HTTP (PR #12850).
+- Cross-origin credential stripping on redirects (PR #12850).
+- Idle-check trigger fix on failed MCP connections (PR #12853).
+- MCP tool cache lookup failure handling (PR #12910).
+
+**Plan-original work:**
+
+- Session-reuse correctness across requests
+  (`MCP-Session-Id` reused, rotated only on re-initialize).
+- Consistent `MCP-Protocol-Version` / `MCP-Session-Id`
+  headers on every request, matching the server's reported
+  values.
 - HTTP 404 → re-initialize (basic). Outstanding-task
   revalidation moves to Phase 4.
-- Per-user token scoping closure.
-- `authContextHash` computed at connection time.
-- Operator policy defaults.
+- Per-user token scoping closure for shared server
+  definitions (recent advisory).
+- `authContextHash` canonicalizer (`packages/api`) +
+  unit-test corpus. Computed at connection time over
+  normalized effective auth configuration.
+- Operator policy defaults (server creation, transport
+  allowlists, per-user task quotas, result-size caps).
+  Defaults lean toward denial.
 
-### Phase 1 — Types + sandbox infra + bridge wrapper (≈1 week)
+### Phase 1 — Types + Apps Preview substrate adoption + delta scaffolds (≈1 week)
 
-End of phase: sandbox origin serves static `proxy.html`; bridge
-handshake works against a fixture server; construction-order
-invariant verified; runtime relay self-test gracefully falls
-back to text on engines where the relay is unsafe; **no
-capability advertised**.
+End of phase: upstream PR #11799 substrate is rebased onto
+the working branch and tests green on chat surface;
+`MCP_APPS_PREVIEW_ENABLED` flag exists but defaults OFF;
+share/search/plugin surfaces fall back to text; Hardened-GA
+delta scaffolds (manifest hasher, content decoder,
+self-contained-HTML validator) land disabled. **No capability
+advertised yet.**
 
-- Types in `packages/data-provider`, generated from the pinned
-  ext-apps release.
+**Inherit + adapt:**
+
+- Rebase / cherry-pick PR #11799 onto Phase 0's branch state.
+- Types in `packages/data-provider`, generated from the
+  pinned `@modelcontextprotocol/ext-apps` release where they
+  were not added by #11799.
 - `packages/api/src/mcp/connection.ts` reads per-tool
-  `execution.taskSupport`. Does not advertise Apps or Tasks.
-- Sandbox infrastructure: static `proxy.html` served from
-  `MCP_SANDBOX_ORIGIN` with `frame-ancestors` CSP header. **One
-  proxy iframe per app instance** (no pooling).
-- Wrap `AppBridge`. Implement the explicit-origin transport shim
-  around `PostMessageTransport`'s receive logic. Add hop-
-  specific validation: host rejects `null` origin; proxy stamps
-  per-view nonce on relayed inbound messages.
-- **Lazy-load** the bridge runtime on the client; verify the
-  default chat bundle does not include `AppBridge` /
-  `PostMessageTransport` / Zod when no Apps view is mounted.
-- **Construction-order test**: a fixture proves that flipping
-  the order (`srcdoc` before listener attach) reliably reproduces
-  a dropped handshake, and the production code path always uses
-  the safe order.
-- **Hop-separated relay test (proxy-stamped nonce)**: messages
-  relayed through the proxy carry the proxy-stamped nonce; the
-  app cannot read or forge it; messages from the inner frame to
-  the host directly (bypassing the proxy) are rejected. Run on
-  Chromium, Firefox, and WebKit/Safari.
-- **Folded-in relay probe**: the host instruments the first
-  relayed `ui/initialize` with the `MCP_APPS_INITIALIZE_TIMEOUT_MS`
-  deadline; on timeout or schema/nonce failure, the host tears
-  down the iframe and falls back to legacy text-only rendering
-  for that mount. There is no separate ping protocol surface.
-- **Content decoding pipeline**: MIME validation
-  (`text/html;profile=mcp-app`), `text`/`blob` decode under
-  `MCP_APPS_MAX_HTML_BYTES`, UTF-8 validation, multi-content
-  rejection.
-- **`MCPAppLaunchManifest` builder + canonical-JSON hasher**
-  (RFC 8785 JCS). Tests cover deterministic hash output across
-  field orderings and against a fixture corpus.
-- `MCPResourceReview` collection + **self-contained-HTML
-  validator** (rejects `<script src>`, `<link href>`,
-  `<img src>` to remote, `<base>`, etc.).
-- `MCPAppInstance` collection scaffold for remount.
-- **Outer-proxy-iframe** sandbox flags pinned to
-  `allow-scripts allow-same-origin`; **inner-iframe** sandbox
-  flag set excludes `allow-same-origin`. Cross-engine test
-  asserts both attributes are correct on render.
-- **Operational-limits scaffold**: settings parsed and applied
-  even though most surfaces are fixture-only at this phase.
-- **`authContextHash` canonicalizer** lands with its
-  unit-test corpus; consumed by Phase 0 connection setup.
+  `execution.taskSupport` (does not advertise Apps or Tasks).
+- Add `MCP_APPS_PREVIEW_ENABLED` and
+  `MCP_APPS_HARDENED_ENABLED` flags. Deprecate the older
+  `MCP_APPS_ENABLED` (alias to Preview only, with a startup
+  warning).
+- **Live-chat-only narrowing**: in
+  `client/src/components/MCPUIResource/MCPUIResource.tsx`
+  and any other `UIResourceRenderer` mount, when
+  `MCP_APPS_PREVIEW_ENABLED=true` and the surface is share,
+  search, or plugin-rendered, render text fallback for
+  resources that carry `_meta.ui.resourceUri`. Chat keeps
+  the Apps path.
+- **Default deny `sandboxPermissions`**: change the legacy
+  renderer default from `'allow-popups'` to `''` regardless
+  of flag state. Add the migration banner.
+- **Verify-with-regression-tests** for the upstream items
+  the plan no longer differentiates on:
+  - Per-instance outer iframes (`MCPAppContainer` →
+    `sandboxSrc`) actually one-per-app.
+  - Same-server binding for `tools/call` and
+    `resources/read`.
+  - `/api/mcp/sandbox` requires auth and `appsEnabled`.
+  - `ui://` URI validation rejects non-`ui://` schemes on
+    forwarded `resources/read`.
+  - Capability advertising disabled when
+    `mcpSettings.apps` is off.
+  - `stableMCPAppRef` survives parent re-renders.
+
+**Hardened-GA delta scaffolds (land disabled, no UX impact
+in Preview):**
+
+- Sandbox infrastructure scaffold: static `proxy.html` served
+  from `MCP_SANDBOX_ORIGIN` with `frame-ancestors` CSP
+  header. Renderer still uses upstream `data:` URL until
+  Phase 2H flips it.
+- `AppBridge` wrapper with explicit-target-origin transport
+  shim, lazy-loaded on the client. Live behind a runtime
+  switch that defaults to the upstream `'*'`-send transport
+  in Preview.
+- `MCPResourceReview` collection scaffold +
+  self-contained-HTML validator + content-decoding pipeline.
+  Behind `MCP_APPS_HARDENED_ENABLED` (no-op when off).
+- `MCPAppLaunchManifest` builder + canonical-JSON hasher
+  (RFC 8785). Unit tests cover determinism across field
+  orderings against a fixture corpus.
+- `MCPAppInstance` collection scaffold (no write path yet —
+  Phase 2H wires it).
+- Operational-limits parser. Settings present even though
+  most enforcement points are gated on Hardened GA.
 - Tests with `mongodb-memory-server` + real
-  `@modelcontextprotocol/sdk` + Playwright cross-origin iframes.
+  `@modelcontextprotocol/sdk` + Playwright cross-origin
+  iframes.
 
 Phase 1 exit criteria:
 
-1. Construction-order test passes on every supported engine.
-2. Hop-separated relay test passes; folded-in initialize probe
-   reliably detects engines where the relay is unsafe and
-   triggers text-only fallback.
-3. Default chat bundle size does not regress by more than a
-   small known delta from `main` when Apps is not in use.
-4. Self-contained-HTML validator rejects every external-asset
-   construct in the test corpus.
-5. Manifest hasher is deterministic across reorderings and
+1. Inherited PR #11799 substrate runs green on chat with
+   `MCP_APPS_PREVIEW_ENABLED=true`.
+2. Share, search, and plugin-rendered surfaces never mount
+   `UIResourceRenderer` for resources carrying
+   `_meta.ui.resourceUri`; they always render text.
+3. Legacy renderer default is deny-by-default
+   `sandboxPermissions=''` in every flag combination.
+4. Manifest hasher is deterministic across reorderings and
    matches fixture vectors byte-for-byte.
+5. Self-contained-HTML validator rejects every external-asset
+   construct in the test corpus (live behind a flag, not yet
+   used in the Preview render path).
 
-### Phase 2 — Apps v1 end-to-end + capability turn-on (≈2–3 weeks)
+### Phase 2P — Apps Preview release (≈1–2 weeks)
 
-End of phase: Apps capability advertised; minimum-viable Apps
-render inline with full HostContext.
+End of phase: Apps capability advertised when
+`MCP_APPS_PREVIEW_ENABLED=true`; live-chat-only Apps render
+inline (and optionally fullscreen behind operator gate); legacy
+renderer still serves share/search/plugin surfaces; the
+hardening delta is **not yet** active.
 
-- New `client/src/components/Chat/MCPApp/` (`ProxyFrame.tsx`,
-  `useMcpApp.ts`).
-- Single predeclared `ui://` resource per tool. Server-side
-  fetch + review + CSP synthesis. No result-time switching.
-- Host-side handlers (v1 subset):
+- Live-chat path adopts upstream PR #11799's
+  `MCPAppContainer`, `MCPAppBridge`, and backend proxies as
+  the rendering substrate.
+- **Single-ACL `forwardMcpRequestFromView` consolidation
+  refactor.** Same-server binding already exists in #11799 via
+  the per-instance `serverName`; Phase 2P consolidates the
+  enforcement points (`tools/call`, `resources/read`, `ping`,
+  `notifications/message`) into one named function and adds
+  the v1 forwarding whitelist + app-visibility check for
+  `tools/call`. This is a refactor of inherited behavior, not
+  a new capability.
+- Host-side handlers (Preview subset):
   - `ui/open-link` — gated by host navigation allowlist;
     confirmation in host chrome.
   - `ui/message` — `role: "user"` only; consent in host chrome;
     non-`user` rejected with clear error.
   - `ui/request-display-mode` — returns the actually-resulting
-    mode; only `inline` honored.
+    mode; `inline` and (when `appSettings.allowFullscreen`)
+    `fullscreen` honored.
   - `ui/update-model-context` — overwrite semantics.
-- **Single-ACL `forwardMcpRequestFromView` for `tools/call`,
-  `resources/read`, `ping`, `notifications/message`** — enforces
-  whitelist, app visibility for `tools/call`, and same-server
-  binding for **all** methods.
 - Host-side notifications: `tool-input`, `tool-result`,
-  `tool-cancelled`, `host-context-changed`, `size-changed`.
-  Implement `ui/resource-teardown`.
-- **Full HostContext on initialize**: theme tokens (CSS variables),
-  locale, timezone, platform, safe-area insets, `displayMode`
-  (`inline`), `availableDisplayModes` (`["inline"]`), `toolInfo`
-  populated from the in-flight tool call.
-- `host-context-changed` notifications on theme/locale/dimension
-  changes.
-- First-launch resource review (full content-decoding pipeline);
-  `manifestHash` recorded; `MCPBuilder/` UI for approvals.
-- **Manifest pinning** wired through `MCPResourceReview` and
-  `MCPAppInstance.manifestHash`; default advisory in v1, hard
-  refuse when `MCP_APPS_HASH_PINNING_REQUIRED=true`.
-  Divergence covers HTML, sandbox flags, permissions, network
-  policy, URI, and trust-policy version — not just bytes.
-- **`MCPAppInstance` write path**: every successful app launch
-  records an instance row so re-opening the conversation
-  re-renders the app without inflating model context. Manifest
-  divergence on rehydrate surfaces a "this app has been
-  updated" notice with a re-approval action. The artifact is
-  intentionally narrow: no view-internal state.
-- **Legacy `UIResourceRenderer` migration**:
-  - Cross-surface audit landed (chat, share, search,
-    plugin-rendered messages); each entry point has a test
-    asserting that, with `MCP_APPS_ENABLED=true`, it routes
-    to the Apps path or falls back to text — never to the
-    legacy renderer.
-  - With `MCP_APPS_ENABLED=false`, default
-    `sandboxPermissions` for the legacy path is changed
-    from `'allow-popups'` to `''`, with a chrome banner.
-  - No mode where both paths render the same message.
-- Trust UX chrome around every view (sandbox-rendered chrome
-  shows server identity, OAuth scopes, `manifestHash`
-  short-prefix, and an exit-app affordance). Trust chrome is
-  mandatory; `_meta.ui.prefersBorder=false` is ignored.
-- Reject resources declaring `_meta.ui.domain` with a clear
-  error.
-- **Two helpers, not one** for the data boundary
-  (`toModelView`, `toViewSurface`). Plumb both through agent
-  tool-result handling, persistence, and view delivery. Tests
-  assert (a) `structuredContent`/`_meta` never leak to the model
-  path, **and** (b) `_meta` (including
-  `io.modelcontextprotocol/related-task` and server-defined
-  keys) is preserved on the view path.
+  `tool-cancelled`, `host-context-changed`, `size-changed`,
+  `ui/resource-teardown`.
+- **Truthful HostContext** (theme tokens, locale, timezone,
+  platform, safe-area insets, `displayMode`, `availableDisplayModes`
+  including `fullscreen` only when `appSettings.allowFullscreen`,
+  `toolInfo` populated from the in-flight tool call).
+- `host-context-changed` notifications on theme / locale /
+  dimension changes.
+- **Two helpers** for the data boundary (`toModelView`,
+  `toViewSurface`). Tests assert
+  `structuredContent`/`_meta` never leak to the model path,
+  and `_meta` (including `io.modelcontextprotocol/related-task`
+  and server-defined keys) is preserved on the view path.
 - **View-bound payload truncation** at
-  `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` with a clear marker
-  so the view sees a deterministic truncation rather than a
-  broken payload.
-- Sizing fallback: apply `MCP_APPS_FALLBACK_HEIGHT_PX` until the
-  first non-zero `size-changed`; honor the `shrinkWrap: false`
-  per-server opt-out.
-- **`ui/resource-teardown`** wait timeout
-  (`MCP_APPS_TEARDOWN_WAIT_MS`); on timeout, force-remove the
-  iframe and log.
+  `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` with a clear
+  marker.
+- **Sizing fallback** alongside upstream `maxHeight`:
+  `MCP_APPS_FALLBACK_HEIGHT_PX` until the first non-zero
+  `size-changed`; `shrinkWrap: false` per-server opt-out.
 - **Per-view rate limits** enforced
   (`MCP_APPS_VIEW_RPC_RATE_PER_MIN`,
   `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN`); over-limit views are
   paused with a clear chrome message.
-- **Apps feature flag** (`MCP_APPS_ENABLED`) added; OFF by
-  default until interop matrix passes. Toggle is independent of
-  Tasks. Turning the flag on **disables** the legacy renderer
-  across all surfaces in the same release; there is no
-  in-between state.
-- **End of phase**: enable Apps capability advertisement when
-  `MCP_APPS_ENABLED=true` and interop matrix passes. Tasks may
-  still be OFF at this point.
+- **Live-chat narrowing locked in.** Tests assert that
+  share / search / plugin surfaces never mount the new Apps
+  path even when `MCP_APPS_PREVIEW_ENABLED=true`.
+- **End of phase**: enable Apps capability advertisement
+  when `MCP_APPS_PREVIEW_ENABLED=true` and the Preview
+  interop matrix passes. Hardened-GA delta scaffolds remain
+  inactive (`MCP_APPS_HARDENED_ENABLED=false`). Tasks may
+  still be OFF.
+
+### Phase 2H — Apps Hardened GA (≈2–3 weeks, follow-up release)
+
+End of phase: with `MCP_APPS_HARDENED_ENABLED=true`, the Apps
+path uses the dedicated `MCP_SANDBOX_ORIGIN` proxy, hop-specific
+relay validation with proxy-stamped nonce, the folded-in
+`ui/initialize` probe, `connect-src 'none'`, self-contained
+HTML, manifest-hash review, and full retirement of
+`UIResourceRenderer` across chat, share, search, and plugin
+surfaces.
+
+- **Replacement delta — sandbox proxy.** Swap the upstream
+  `data:`-URL outer iframe (served from `/api/mcp/sandbox`)
+  for the dedicated-origin `proxy.html` served from
+  `MCP_SANDBOX_ORIGIN`, with `frame-ancestors` enforced via
+  response header. Outer-iframe sandbox stays
+  `allow-scripts allow-same-origin` per the Apps spec; inner
+  app iframe stays without `allow-same-origin`.
+- **Replacement delta — explicit-target-origin transport.**
+  Flip the `AppBridge` transport to send with explicit
+  origins; the upstream `'*'`-send code path becomes
+  unreachable when Hardened GA is on.
+- **Replacement delta — hop-specific validation +
+  proxy-stamped nonce.** Host rejects `null`-origin
+  messages; proxy stamps the per-view nonce on relayed
+  inbound messages; the inner view never sees or echoes the
+  nonce.
+- **Replacement delta — folded-in `ui/initialize` probe.**
+  The first relayed initialize is the relay self-test;
+  failure (timeout / schema / nonce) tears down the iframe
+  and falls back to text-only for that mount.
+- **Replacement delta — content decoding + self-contained
+  HTML.** Activate the Phase 1 scaffolds. Reject MIME
+  mismatch, base64-decode `blob` under
+  `MCP_APPS_MAX_HTML_BYTES`, UTF-8 validate, reject
+  multi-content, run the self-contained-HTML validator.
+- **Replacement delta — `MCPAppLaunchManifest` review +
+  pinning.** First-launch review computes `manifestHash`
+  and stores it in `MCPResourceReview`. Subsequent launches
+  pin against the manifest. Default advisory; hard refuse
+  when `MCP_APPS_HASH_PINNING_REQUIRED=true`. Divergence
+  covers HTML, sandbox flags, permissions, network policy,
+  URI, and trust-policy version.
+- **Replacement delta — `connect-src 'none'`.** The CSP
+  injector ignores `connectDomains` entirely. Inner-view
+  network traffic is impossible. App authors route via
+  `tools/call` / `resources/read` / `ui/open-link`. The
+  upstream `applyAppSettingsToResult` path is retained for
+  Preview but bypassed in Hardened GA.
+- **Replacement delta — full legacy renderer retirement.**
+  When `MCP_APPS_HARDENED_ENABLED=true`, the
+  `UIResourceRenderer` import is no longer reachable from
+  any surface (chat, share, search, plugin). Tests assert
+  this across every entry point.
+- **Replacement delta — `MCPAppInstance` write path** lands.
+  Every successful Hardened-GA app launch records a row;
+  re-opening the conversation rehydrates by replaying the
+  launch lifecycle against the same `manifestHash`.
+  Divergence surfaces "this app has been updated" with a
+  re-approval action. Still narrow: no view-internal state.
+- **Replacement delta — trust chrome mandatory.**
+  `_meta.ui.prefersBorder=false` is ignored. Border +
+  identity chrome must remain visible even in fullscreen.
+- **Replacement delta — `_meta.ui.domain` rejection** with a
+  clear error message in the review pipeline.
+- **`ui/resource-teardown`** wait timeout
+  (`MCP_APPS_TEARDOWN_WAIT_MS`); on timeout, force-remove
+  the iframe and log.
+- **End of phase**: enable Hardened GA capability
+  advertisement when `MCP_APPS_HARDENED_ENABLED=true` and
+  the Hardened interop matrix passes (incl. cross-engine
+  relay tests and full legacy-renderer retirement
+  regression).
 
 ### Phase 3 — `tool-input-partial` (≈1 week, optional)
 
@@ -1902,15 +2255,22 @@ for implemented directions.
   - When absent, agent uses a neutral default.
 - Frontend running-jobs surface in
   `client/src/components/SidePanel/`: cursor-paginated, status
-  badges, progress bars (when `progressToken` present), cancel
-  button (disabled for terminal and `input_required` states),
-  deep-link to originating conversation. Localize under
-  `com_ui_mcp_task_*`.
+  badges, **status-only by default** (no progress bars in
+  v1 — those reuse upstream PR #12535 once it lands and is
+  not a Phase 4 dependency), cancel button (disabled for
+  terminal and `input_required` states), deep-link to
+  originating conversation. Localize under
+  `com_ui_mcp_task_*`. The `progressToken` is still
+  correlated and propagated through the bridge to mounted
+  views; the SidePanel just doesn't render progress bars
+  itself in v1.
 - **Tasks feature flag** (`MCP_TASKS_ENABLED`) added; OFF by
-  default. Independent of `MCP_APPS_ENABLED` so Apps may have
-  shipped already.
+  default. Independent of `MCP_APPS_PREVIEW_ENABLED` and
+  `MCP_APPS_HARDENED_ENABLED`. Tasks may ship before, after,
+  or between Apps Preview and Apps Hardened GA.
 - **End of phase**: enable Tasks capability advertisement when
-  `MCP_TASKS_ENABLED=true` and the Tasks interop matrix passes.
+  `MCP_TASKS_ENABLED=true` and the Tasks interop matrix
+  passes.
 
 ### Phase 5 — Hardening, browser matrix, ops docs (≈1 week)
 
@@ -2020,34 +2380,61 @@ the user navigates.
   extension.
 - **Operator deployment cost.** A single sandbox subdomain is
   required.
+- **Two trust models in production simultaneously.** During
+  the window between Apps Preview launch and Apps Hardened
+  GA, apps render under the upstream #11799 trust model on
+  chat (`'*'`-send postMessage, `event.source` validation,
+  `data:`-URL outer iframe, `connectDomains` honored) while
+  the legacy `UIResourceRenderer` runs on share/search/plugin
+  surfaces (deny-default `sandboxPermissions=''`). This is
+  intentional and bounded; Hardened GA closes the window.
+  Operators who cannot accept the Preview model on chat keep
+  both flags off and rely on the deny-default legacy
+  renderer.
 - **Self-contained-HTML rule is a real constraint on app
-  authors.** v1 forbids remote scripts, styles, fonts, and
-  images. App authors must bundle. This is the cost of letting
-  the host truthfully claim it has approved the bytes the user
-  runs. Operator docs make this rule prominent so app authors
-  hit it at design time, not deploy time.
-- **No direct browser networking is the bigger constraint.**
-  v1 cuts in-app `fetch` / XHR / WebSocket entirely. Apps
-  whose bundle today calls a third-party API have to expose
-  that as an MCP tool on their server (the host calls it on
-  the view's behalf) or use `ui/open-link` for user-driven
-  navigation. The reason is that without `allow-same-origin`
-  on the inner frame and without `_meta.ui.domain`, the
-  inner-frame origin is `null`, which fails for conservative
-  CORS, cookies, OAuth, and origin-based API allowlists.
-  Re-introducing `connect-src` is post-v1 and depends on a
-  stable-origin design.
+  authors (Hardened GA only).** Hardened GA forbids remote
+  scripts, styles, fonts, and images; Preview honors
+  upstream `resourceDomains`. Operator docs explain the
+  difference so app authors do not ship a Preview-only bundle
+  and discover at Hardened GA cutover that it is rejected.
+- **No direct browser networking is the bigger Hardened-GA
+  constraint.** Hardened GA cuts in-app `fetch` / XHR /
+  WebSocket entirely; Preview keeps the upstream
+  `connectDomains` model. Apps whose bundle calls a
+  third-party API directly will keep working in Preview but
+  break at Hardened GA cutover unless they migrate to
+  bridge-routed tools. The reason is that without
+  `allow-same-origin` on the inner frame and without
+  `_meta.ui.domain`, the inner-frame origin is `null`, which
+  fails for conservative CORS, cookies, OAuth, and
+  origin-based API allowlists. Re-introducing `connect-src`
+  is post-Hardened-GA and depends on a stable-origin design.
 - **Approval is over a manifest, not just bytes.** Hash
   divergence catches policy drift (sandbox, permissions,
   network policy, URI, trust-policy version), not just byte
   drift. App authors must understand that altering CSP
   metadata or sandbox flags forces re-approval even if the
   HTML is unchanged.
-- **Legacy `UIResourceRenderer` retirement is binary.** When
-  `MCP_APPS_ENABLED=true`, the legacy renderer is gone from
-  every surface. Operators who depended on
-  `'allow-popups'`-style behavior must migrate or stay on the
-  flag-off path with the deny-default banner.
+- **Legacy `UIResourceRenderer` retirement is staged across
+  Preview → Hardened GA.** Preview retires it only on chat;
+  Hardened GA retires it across share, search, and
+  plugin-rendered surfaces. The default
+  `sandboxPermissions=''` change applies even when both
+  Apps flags are off, so operators who never opt in still
+  get the deny-default safety improvement.
+- **Inheritance risk: PR #11799 changes upstream while we're
+  building.** The plan adopts #11799 substantially as-is. If
+  upstream rebases, force-pushes, or substantially changes
+  the Apps API surface, Phase 1's rebase work expands.
+  Mitigation: pin to a known commit on the
+  `KyleKincer:feat/mcp-apps` branch and explicitly track
+  upstream changes during Phase 1 rather than continuously
+  rebasing.
+- **Inheritance risk: PR #11799 does not land in `main`.**
+  If #11799 stalls or is rejected, the plan still cherry-
+  picks it from the open PR. That doubles the maintenance
+  burden of upstream syncs but does not block shipping
+  Preview.
 - **Operational limits may surprise app authors.**
   `MCP_APPS_MAX_HTML_BYTES = 2 MiB` rules out giant
   pre-bundled apps; rate limits cap chatty views. Limits are
@@ -2129,10 +2516,35 @@ the cross-origin iframe layer.
 
 ### MCP Apps
 
-- Capability negotiation truthfully gated.
-- Discovery: tool `_meta.ui.resourceUri` for a resource omitted
-  from `resources/list` still renders; resource without
-  `_meta.ui` falls back to text.
+Tests are tagged **[P]** (Preview), **[H]** (Hardened GA), or
+**[A]** (both). Some tests have different shapes per track and
+are listed twice.
+
+- **[A]** Capability negotiation truthfully gated by
+  `MCP_APPS_PREVIEW_ENABLED` / `MCP_APPS_HARDENED_ENABLED`.
+- **[A]** Discovery: tool `_meta.ui.resourceUri` for a
+  resource omitted from `resources/list` still renders;
+  resource without `_meta.ui` falls back to text.
+- **[A]** Live-chat-only narrowing: with Preview on (and any
+  Hardened state), share, search, and plugin-rendered
+  surfaces never mount the new Apps path; they always render
+  text. With both flags off, share/search/plugin still
+  fall back to text via the deny-default legacy renderer
+  (no popups).
+- **[A]** Default `sandboxPermissions=''` on the legacy
+  renderer regardless of flag state. Test asserts no entry
+  point still uses `'allow-popups'`.
+- **[H]** Full retirement of `UIResourceRenderer` import
+  reachability. With `MCP_APPS_HARDENED_ENABLED=true`, no
+  surface (chat, share, search, plugin) can mount the
+  legacy renderer; tree-shake / module-graph test asserts
+  the import is unreachable.
+- **[A]** Adoption regression for items inherited from
+  #11799: per-instance outer iframe, per-instance
+  `serverName` binding, `/api/mcp/sandbox` auth +
+  `appsEnabled` gate, `ui://` URI validation,
+  `stableMCPAppRef` survival across parent re-render,
+  `appSettings.allowFullscreen` gating fullscreen mount.
 - Stable wire format: `sandbox-resource-ready` carries
   `{ html, sandbox, csp, permissions }`. Proxy renders via
   `srcdoc` + filtered iframe `sandbox` attribute + injected
@@ -2338,21 +2750,38 @@ the cross-origin iframe layer.
 
 ## Effort summary
 
+Estimates assume implementation starts from `dev` (so PRs
+#12850 / #12853 / #12910 are inherited) and that PR #11799 is
+the Apps Preview substrate. They have shrunk significantly
+versus v8 because v9 stops parallel-building the Apps
+substrate.
+
 | Phase | Estimate |
 |---|---|
-| 0 — Transport reliability + auth-context substrate | 3–5 days |
-| 1 — Types + sandbox infra + bridge wrapper (incl. construction-order + nonce relay tests) | 1 week |
-| 2 — Apps v1 end-to-end + full HostContext + capability turn-on | 2–3 weeks |
+| 0 — Transport reliability + auth-context (inherits `dev` fixes) | 2–4 days |
+| 1 — Types + Apps Preview substrate adoption + Hardened delta scaffolds + legacy default-deny + live-chat narrowing | ~1 week |
+| 2P — Apps Preview release (single-ACL refactor, full HostContext, fullscreen gate, payload truncation, rate limits, capability turn-on) | 1–2 weeks |
+| 2H — Apps Hardened GA (sandbox-origin proxy, hop-specific relay + nonce, folded init probe, manifest review, full legacy retirement, MCPAppInstance write path, `connect-src 'none'`) | 2–3 weeks (separate release) |
 | 3 — `tool-input-partial` (optional) | 1 week (risk) |
-| 4 — MCP Tasks v1 (parallel with 2) | 2 weeks |
+| 4 — MCP Tasks v1 (status-only jobs panel; progress UI deferred to #12535 reuse) | ~2 weeks |
 | 5 — Hardening + browser matrix + ops docs | 1 week |
-| **Total (serial, excl. parallelism)** | **~5.5–7.5 weeks** |
-| **Phases 0 + 1 + 2** (Apps shipped, Tasks deferred) | **~3.5–4.5 weeks** |
-| **Phases 0 + 1 + 2 + 4** (functional CAD app, Tasks v1) | **~3.5–5 weeks** |
 
-The **Apps-only** track is now a first-class option because Apps
-and Tasks are gated by independent feature flags. If Tasks slips
-past v1 cut, Apps still ships.
+Suggested release tracks:
+
+| Track | Phases | Estimate |
+|---|---|---|
+| **Apps Preview release (chat)** | 0 + 1 + 2P | **~2.5–3.5 weeks** |
+| **Apps Preview + Tasks v1** | 0 + 1 + 2P + 4 | **~3–4 weeks** (4 can run parallel with 2P) |
+| **Apps Hardened GA release** | + 2H | **+2–3 weeks** after Preview |
+| **Full v1 (Hardened GA + Tasks)** | 0 + 1 + 2P + 2H + 4 | **~5–7 weeks** |
+
+The **Apps Preview** track is now a first-class shipping
+option. It provides interactive app rendering on the chat
+surface with the upstream #11799 trust model — weaker than
+Hardened GA, but materially better than the current legacy
+renderer's `'allow-popups'` default. Hardened GA can follow
+in a later release without holding Preview's user-visible
+experience hostage to the full v8 security delta.
 
 ## References
 
