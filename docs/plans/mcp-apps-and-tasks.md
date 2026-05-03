@@ -800,6 +800,143 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
 Reference:
 <https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks>
 
+## Upstream context and related work
+
+This plan does not exist in a vacuum. The following upstream
+LibreChat artifacts (`danny-avila/LibreChat`) overlap with or
+adjacent-to this scope and should be tracked alongside it.
+
+### Direct overlap — MCP Apps
+
+- **PR [#11799](https://github.com/danny-avila/LibreChat/pull/11799)
+  — `feat: MCP Apps Extension Support`** (open, branch
+  `KyleKincer:feat/mcp-apps`). Implements the same
+  `io.modelcontextprotocol/ui` capability this plan targets:
+  `_meta.ui.resourceUri` discovery through tool definitions, a
+  two-layer sandboxed iframe at
+  `client/public/mcp-sandbox.html`, a JSON-RPC bridge
+  (`MCPAppBridge.ts` with optional
+  `@modelcontextprotocol/ext-apps` SDK adapter), an `mcp_app`
+  artifact attachment, backend proxies at
+  `/api/mcp/{resources/read, app-tool-call, sandbox}`,
+  `mcpSettings.apps` / `appSettings` configuration, dynamic
+  CSP synthesis, and a `modelTools` vs `allTools` visibility
+  split.
+- **Issue [#10641](https://github.com/danny-avila/LibreChat/issues/10641)
+  — `Enhancement: Support for MCP Apps`** (open). The
+  long-standing tracking issue that #11799 implements against.
+
+**This plan diverges from #11799 on the following axes**, and
+those divergences are intentional rather than re-implementations
+of work already in flight:
+
+1. **Self-contained HTML only.** #11799 allows external assets
+   via `resourceDomains`-driven CSP. v8 cuts external assets
+   entirely so approval can bind to bytes (see
+   `manifestHash`).
+2. **No direct browser networking.** #11799 honors
+   `connectDomains` and lets the view `fetch` directly. v8
+   sets `connect-src 'none'` and routes everything through
+   `tools/call` / `resources/read` / `ui/open-link` because
+   the `null` inner-frame origin makes credentialed browser
+   networking unreliable.
+3. **One proxy iframe per app instance, not one shared
+   sandbox.** #11799 mounts a single `mcp-sandbox.html` and
+   multiplexes view lifecycle through it. v8 spawns one outer
+   proxy iframe per rendered app instance to keep teardown,
+   audit, and source pinning trivial.
+4. **Hop-specific relay validation with proxy-stamped per-view
+   nonce.** #11799 uses standard `event.source` checks; v8
+   adds the nonce to survive WebKit/Safari's relay
+   `event.source === window` quirk and rejects `null` origin
+   at the host hop entirely.
+5. **Approval over a launch manifest, not just HTML hash.**
+   v8 binds review and remount to a canonical manifest
+   covering sandbox flags, permissions, network policy, URI,
+   and trust-policy version, so policy drift forces
+   re-approval.
+6. **Construction-order invariant** explicit and tested as a
+   Phase 1 exit criterion (the upstream `srcdoc` race
+   discussion and PR #543 in `modelcontextprotocol/ext-apps`).
+7. **Trust chrome mandatory; `prefersBorder=false` ignored.**
+8. **Legacy `MCPUIResource` / `UIResourceRenderer` path
+   binary-gated**, including chat, share, search, and
+   plugin-rendered surfaces. #11799 introduces the new path
+   alongside the legacy renderer; v8 makes the migration
+   explicit and exclusive.
+9. **Operational limits and rate limits with concrete defaults.**
+10. **Streamable HTTP–only Tasks support with
+    `authContextHash` ownership binding** (separate scope from
+    Apps; #11799 does not touch Tasks).
+
+If #11799 lands first in `main`, this plan should be reframed
+as an evolution of that branch rather than a parallel
+implementation. Any item already covered upstream becomes a
+regression-only test in this plan.
+
+### Direct overlap — MCP Tasks
+
+- **Issue [#11997](https://github.com/danny-avila/LibreChat/issues/11997)
+  — `Enhancement: Support for MCP Tasks`** (open, no PR, no
+  branch). Names the SEP-1686 use case (long-running tool
+  calls without fixed timeouts) but does not enumerate
+  `tasks/get` / `tasks/list` / `tasks/cancel` / `tasks/result`.
+  All Tasks work in this plan is greenfield against upstream;
+  cite #11997 as the open ask and the natural place to file
+  the eventual PR.
+
+### Adjacent — transport reliability
+
+- **PR [#12850](https://github.com/danny-avila/LibreChat/pull/12850)
+  — `fix: Follow 307/308 redirects in MCP streamable HTTP
+  transport`** (merged Apr 29 2026 into `dev`; **not** in
+  HEAD `738003b220a91ec724286dab0354080e22f8aac9`).
+  Method-preserving 307/308 follow with depth limit 5,
+  cross-origin credential stripping (`Authorization`,
+  `Cookie`, `mcp-session-id`, configured server headers,
+  `Proxy-Authorization`), SSRF revalidation per hop,
+  HTTPS→HTTP downgrade block. Phase 0 should track the merge
+  to `main`; if it stalls, port the work or fold its tests in.
+- **PR [#12853](https://github.com/danny-avila/LibreChat/pull/12853)
+  — idle-check trigger fix** (merged Apr 29 2026, transport
+  hygiene).
+- **PR [#12910](https://github.com/danny-avila/LibreChat/pull/12910)
+  — MCP tool cache lookup failure handling** (merged May 2
+  2026, hygiene).
+- **Issue [#12802](https://github.com/danny-avila/LibreChat/issues/12802)
+  — proactive MCP OAuth token refresh with per-user jitter**
+  (open, adjacent to per-user token scoping).
+- **PR [#12535](https://github.com/danny-avila/LibreChat/pull/12535)
+  — MCP progress notifications** (open, adjacent to the
+  long-running-Tasks UX surface).
+
+### Adjacent — already in HEAD `738003b`
+
+These have already landed and are foundations this plan builds
+on (no Phase 0 work required):
+
+- PR #12782 (tenant context in MCP OAuth callback).
+- PR #12763 (`WWW-Authenticate` `resource_metadata` hint).
+- PR #12755 (validate OAuth protected-resource metadata
+  binding).
+- PR #12745 (persist/enforce `disable-model-invocation`,
+  `user-invocable`, `allowed-tools`).
+- PR #12812 (handle unhandled MCP OAuth reconnect rejections).
+
+### Notably absent upstream
+
+There is **no** open PR or issue upstream covering:
+
+- `MCP-Session-Id` reuse correctness, `MCP-Protocol-Version`
+  header consistency, or HTTP 404 → re-initialize.
+- Per-user header/token scoping for shared server
+  definitions (the recent advisory).
+- Outstanding-task revalidation after a session re-init.
+- Replacement or retirement of the legacy
+  `MCPUIResource` / `UIResourceRenderer` path.
+
+These remain plan-original work in Phase 0 and Phase 4.
+
 ## Current state of LibreChat MCP integration
 
 | Area | Status | Location |
@@ -812,10 +949,10 @@ Reference:
 | Cross-surface audit of `UIResourceRenderer` mounts (chat, share, search, plugin) | Phase 1 | client surfaces |
 | Default deny `sandboxPermissions` on legacy path when `MCP_APPS_ENABLED=false` | Phase 1 | legacy renderer |
 | Sampling / elicitation | Missing | blocks `input_required` |
-| 307/308 redirect handling on Streamable HTTP | Done on `main` | transport layer |
-| Cross-origin credential stripping on redirects | Done on `main` | transport layer |
-| Streamable HTTP session reuse correctness, header consistency, 404 → re-init | Phase 0 | transport layer |
-| Per-user header/token scoping (recent advisory) | Phase 0 | transport layer |
+| 307/308 redirect handling on Streamable HTTP | **Upstream PR #12850** (merged to `dev`, **not** in HEAD `738003b`) | transport layer |
+| Cross-origin credential stripping on redirects | **Upstream PR #12850** (same — in `dev`, not HEAD) | transport layer |
+| Streamable HTTP session reuse correctness, header consistency, 404 → re-init | Phase 0 (plan-original) | transport layer |
+| Per-user header/token scoping (recent advisory) | Phase 0 (plan-original) | transport layer |
 | Apps capability negotiation (gated by `MCP_APPS_ENABLED`) | Missing | — |
 | `_meta.ui.resourceUri`-driven discovery (server-side) | Missing | — |
 | Cross-origin sandbox proxy + stable wire-format flow | Missing | — |
@@ -1464,9 +1601,31 @@ actually share.
   transport allowlists, per-user task quotas, result-size caps —
   defaults lean toward denial.
 
-Items already landed on `main` are explicitly **not** Phase 0
-work: 307/308 redirect handling and credential-stripping on
-cross-origin redirects. Spot-check no regression and move on.
+**Upstream redirect-handling work is in `dev`, not in HEAD.**
+Earlier revisions of this plan asserted that public `main` already
+shipped 307/308 redirect handling and cross-origin credential
+stripping. That is not true at HEAD `738003b`. Upstream
+[PR #12850](https://github.com/danny-avila/LibreChat/pull/12850)
+(merged Apr 29 2026 into `dev`) adds method-preserving
+307/308 follow-through with cross-origin credential stripping
+(`Authorization`, `Cookie`, `mcp-session-id`, configured
+server headers, `Proxy-Authorization`), depth limiting, SSRF
+revalidation per hop, and HTTPS→HTTP downgrade blocking.
+That work has not yet promoted to `main` as of this revision.
+
+Phase 0 should therefore:
+
+1. **Track upstream merge.** When PR #12850 promotes to
+   `main`, treat the redirect/credential-stripping items as
+   inherited and write a regression-only Phase 0 spot-check
+   for them.
+2. **If upstream slips**, port PR #12850 (or fold its tests
+   into Phase 0) so this plan does not block on an external
+   timeline.
+3. Keep the plan-original Phase 0 items below as remaining
+   work regardless: session reuse, header consistency, 404 →
+   re-init, per-user token scoping, `authContextHash`,
+   operator policy defaults.
 
 ## Phased plan
 
@@ -2197,6 +2356,8 @@ past v1 cut, Apps still ships.
 
 ## References
 
+### Specs
+
 - MCP Apps spec (stable 2026-01-26):
   <https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx>
 - MCP Apps repo + SDK: <https://github.com/modelcontextprotocol/ext-apps>
@@ -2208,11 +2369,34 @@ past v1 cut, Apps still ships.
   <https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1686>
 - 2026 MCP roadmap:
   <https://blog.modelcontextprotocol.io/posts/2026-mcp-roadmap/>
-- MDN: iframe sandbox guidance
+
+### Upstream LibreChat (`danny-avila/LibreChat`)
+
+- PR #11799 — `feat: MCP Apps Extension Support` (open):
+  <https://github.com/danny-avila/LibreChat/pull/11799>
+- Issue #10641 — `Enhancement: Support for MCP Apps` (open):
+  <https://github.com/danny-avila/LibreChat/issues/10641>
+- Issue #11997 — `Enhancement: Support for MCP Tasks` (open):
+  <https://github.com/danny-avila/LibreChat/issues/11997>
+- PR #12850 — `fix: Follow 307/308 redirects in MCP streamable
+  HTTP transport` (merged to `dev`, not in HEAD):
+  <https://github.com/danny-avila/LibreChat/pull/12850>
+- PR #12853 — idle-check trigger fix:
+  <https://github.com/danny-avila/LibreChat/pull/12853>
+- PR #12910 — MCP tool cache lookup failure handling:
+  <https://github.com/danny-avila/LibreChat/pull/12910>
+- PR #12535 — MCP progress notifications (open, adjacent to
+  Tasks UX): <https://github.com/danny-avila/LibreChat/pull/12535>
+- Issue #12802 — proactive MCP OAuth token refresh:
+  <https://github.com/danny-avila/LibreChat/issues/12802>
+
+### MDN
+
+- iframe sandbox guidance:
   <https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe>
-- MDN: srcdoc and base URL behavior
+- srcdoc and base URL behavior:
   <https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe#attr-srcdoc>
-- MDN: Content-Security-Policy and meta-tag limitations
+- Content-Security-Policy and meta-tag limitations:
   <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>
-- MDN: Window.postMessage origin validation
+- Window.postMessage origin validation:
   <https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage>
