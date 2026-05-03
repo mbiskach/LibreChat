@@ -3,56 +3,98 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v5 — corrects protocol bugs and tightens v1 scope after the
-fourth review:
+**Revision:** v6 — fixes browser/runtime edge cases and trims residual
+ambition after the fifth review:
 
-- **Cancellation after terminal state returns `-32602` invalid params**, not
-  "existing terminal status." v4's test matrix had this wrong.
-- **`input_required` preserves the server's actual task status.** v4 wrote a
-  fake failed envelope, which invented protocol state. v5 keeps the
-  server-reported `input_required` status and marks a separate host-local
-  field `hostHandlingState = "unsupported_lifecycle"`.
-- **Drop the API-process background poller.** Active-subscriber polling
-  only: a chat tab, a mounted view, or an open jobs panel each runs its
-  own poll while present. When the user is gone, polling stops; on return
-  the jobs panel reloads via `tasks/list` / `tasks/get`.
-- **Drop the durable subscriber registry.** Subscriber sets stay in memory
-  per connected client session. On reconnect, resubscribe and reload from
-  `tasks/get`.
-- **`tasks/result` rehydrates the underlying response shape.** Pointerized
-  blob-offload is an internal storage detail; the response wire shape is
-  byte-equivalent to what the original request would have returned.
-- **`_meta.ui.domain` is explicitly unsupported in v1.** Resources that
-  declare it are rejected at review time with a clear error.
-- **Asset URL policy.** v1 accepts only self-contained HTML (inline JS/CSS)
-  or absolute HTTPS URLs covered by `_meta.ui.csp.resourceDomains`. The
-  review pipeline rejects relative asset URLs because `about:srcdoc`
-  resolves them against the embedding document, not against the original
-  `ui://` URI.
-- **PostMessage transport shim.** v4 said "use the official
-  `PostMessageTransport`" *and* "no `*` target origins." The SDK's current
-  transport sends with `*`. v5 wraps `AppBridge` in a thin transport that
-  sends to explicit origins; the SDK's receive validation is preserved.
-- **Iframe sandbox flags hardened.** v1 never grants `allow-popups`,
-  `allow-top-navigation`, `allow-top-navigation-by-user-activation`, or
-  `allow-forms`, regardless of the resource's `_meta.ui.sandbox` request.
-  `ui/open-link` is the single navigation escape hatch.
-- **Single ACL for all forwarded MCP methods.** Every proxied request from
-  a view (`tools/call`, `resources/read`, `ping`, `notifications/message`)
-  goes through one central ACL bound to the view's originating MCP server
-  connection. Cross-server forwarding is impossible by construction.
-- **Resource fetch/hash/review is server-side.** The browser receives an
-  already-approved payload; it does not orchestrate `resources/read` or
-  hashing.
-- **`ui/message` schema-vs-prose note.** The generated stable schema
-  literals `role: "user"`. The prose page still says "preserve the
-  specified role." We follow the schema and keep `user`-only.
-- **CAD example: persist artifact handle, not presigned URL.** Presigned
-  URLs are time-limited; storing them in durable task results breaks
-  return-later UX.
-- **Phase 3 collapsed into Phase 2.** `toolInfo`, theme, locale, timezone,
-  `displayMode`, and `availableDisplayModes` are basic HostContext surface;
-  shipping Apps without them creates avoidable app-compat churn.
+- **Host construction order is now an architectural invariant.** The
+  `srcdoc` initialization race is real: if HTML is loaded before the
+  host's postMessage listener is attached, the view's `ui/initialize`
+  is dropped and the bridge silently hangs. v6 pins the only safe
+  order — append iframe → grab `contentWindow` from initial
+  `about:blank` → construct/connect transport → set `srcdoc` — and
+  makes it a Phase 1 exit criterion.
+- **Safari/WebKit relay gate.** Upstream has an open issue where the
+  sandbox relay sees `event.source === window` instead of
+  `inner.contentWindow`, breaking the v5 "match source identity"
+  rule. v6 binds inner-frame trust with a per-view nonce
+  (`ui/notifications/sandbox-resource-ready` carries it; the inner
+  view echoes it through the relay) so source identity is no longer
+  the sole trust primitive. Safari ships in v1 only if the relay
+  passes its interop matrix; otherwise Safari is documented as
+  unsupported for Apps.
+- **Data boundary split into model path vs view path.** v5 said
+  "strip non-model fields before model exposure," which is correct
+  for the model path. v6 adds the inverse rule explicitly: the view
+  path **must** preserve the full `CallToolResult` including `_meta`
+  for live `tool-result` notifications and for `tasks/result`
+  rehydration. Apps and Tasks both depend on this; dropping `_meta`
+  to the view breaks `io.modelcontextprotocol/related-task` and
+  Apps-server-defined view metadata.
+- **`tasks/result` rehydration is semantically equivalent, not
+  byte-equivalent.** v5 over-specified this. The spec requires the
+  same successful result or JSON-RPC error the underlying request
+  would have returned, including `_meta`. It does not require
+  preserving JSON key order, whitespace, or original serializer byte
+  streams. v6 stores canonical envelopes preserving
+  parsed-JSON-RPC structural equivalence and result/error semantics.
+- **Jobs panel is status-only by default.** v5's test matrix said
+  opening the jobs panel triggers `tasks/result` for every terminal
+  task — that contradicts the design text and the spec, which lets
+  hosts continue polling and only fetch results on demand. v6 lists
+  with `tasks/list`, refreshes with `tasks/get`, surfaces TTL and
+  status, and only invokes `tasks/result` on explicit detail entry,
+  a "wait for result" action, or an opportunistic save when a
+  subscribed task reaches terminal while the user is present.
+- **Drop the operator allowlist for `optional` task tools.** The
+  protocol-native rule is enough for v1: `required` runs as task,
+  `forbidden` does not, `optional` runs synchronously. The
+  allowlist added a second policy axis without changing what users
+  experience. Removed.
+- **AppBridge is lazy-loaded on the client.** Importing
+  `AppBridge` + `PostMessageTransport` pulls Zod and adds ~377 KB
+  minified to the entry bundle. v6 defers the import until an Apps
+  view actually mounts so the default chat bundle stays lean.
+- **Phase 0 trimmed.** Public `main` already handles 307/308
+  redirects manually and strips credential-bearing headers
+  (`authorization`, `cookie`, `mcp-session-id`) on cross-origin
+  redirects, matching the Streamable HTTP session-safety guidance.
+  Phase 0 now focuses on what actually remains: session-reuse
+  correctness, consistent `MCP-Protocol-Version` / `MCP-Session-Id`
+  headers, HTTP 404 → re-initialize + outstanding-task
+  revalidation, and per-user token scoping.
+- **Apps and Tasks release trains decoupled.** Apps are stable;
+  Tasks are still experimental. v6 puts each behind its own feature
+  flag (`MCP_APPS_ENABLED`, `MCP_TASKS_ENABLED`) so Apps can ship
+  first if Tasks slips, without holding back the user-visible UX.
+- **Sizing fallback policy added.** Upstream is still carrying a
+  fix for default auto-resize collapsing common `height: 100%`
+  layouts on first render. v6 defines a host-side fallback height
+  policy (minimum 320 px until the first non-zero
+  `size-changed`, configurable cap) and an opt-out for aggressive
+  shrink-wrap.
+
+Carried forward from v5 (still in force):
+
+- Cancellation after terminal returns `-32602` invalid params.
+- `input_required` preserves server status; host marks
+  `hostHandlingState = "unsupported_lifecycle"`; no fake `failed`
+  envelope.
+- Active-subscriber polling only; no API-process background
+  poller; no durable subscriber registry.
+- `_meta.ui.domain` unsupported in v1; single `MCP_SANDBOX_ORIGIN`.
+- Asset URL policy: inline or absolute-HTTPS in
+  `_meta.ui.csp.resourceDomains` only.
+- PostMessage transport wrapper around `AppBridge` sends to
+  explicit target origins; preserves SDK receive validation.
+- Iframe sandbox hardened defaults; `ui/open-link` is the only
+  navigation escape hatch.
+- Single ACL for all forwarded MCP methods; cross-server
+  forwarding impossible by construction.
+- Resource fetch/hash/review is server-side; browser receives
+  already-approved payloads.
+- `ui/message` is `user`-only per generated stable schema.
+- CAD example persists artifact handle, not presigned URL.
+- Phase 3 (`tool-input-partial`) remains optional and post-v1.
 
 ## Goal
 
@@ -102,6 +144,31 @@ Tasks v1.
    to **explicit target origins** instead of the SDK transport's
    default `*`. The SDK's receive-side validation
    (`event.source`, JSON-RPC envelope schema) is preserved.
+8. **Host construction order is an invariant, not a queue.** The
+   only safe sequence to render a sandbox-resource view is: append
+   the proxy iframe to the DOM → grab its `contentWindow` while it
+   is still the initial `about:blank` → construct and connect the
+   host transport / message listener → only then deliver `srcdoc`.
+   Any other ordering allows the view to send `ui/initialize`
+   before the host listens, dropping the handshake silently. This
+   is enforced in code and gated as a Phase 1 exit criterion. v6
+   does **not** introduce a deferred-target queue inside the
+   transport; that approach was rejected upstream as a silent-hang
+   risk.
+9. **Inner-frame trust uses a per-view nonce, not raw `event.source`
+   identity.** Safari/WebKit reports `event.source === window` for
+   sandbox-relayed messages, so the v5 "source must equal inner
+   `contentWindow`" rule fails on that engine. v6 issues a 128-bit
+   nonce per view, hands it to the proxy via
+   `ui/notifications/sandbox-resource-ready`, expects every relayed
+   inbound message to echo it, and treats nonce mismatch as fatal.
+   `event.origin`, `event.source`, JSON-RPC envelope schema, and
+   the nonce are all required.
+10. **Apps and Tasks release behind separate feature flags.**
+    `MCP_APPS_ENABLED` and `MCP_TASKS_ENABLED` are independent.
+    Apps may turn on without Tasks; Tasks may stay off through
+    multiple Apps minor releases. This keeps the experimental
+    Tasks spec from blocking the stable Apps user experience.
 
 ## Pinned protocol versions
 
@@ -146,6 +213,10 @@ v1 rejects non-`user` roles with a clear error.
 | `Cross-Origin-Embedder-Policy: require-corp` | Same |
 | Tokenized `/view/:token` hardened delivery | Future, post-v1 host extension |
 | Proactive `_meta.ui.resourceUri` crawl after every `tools/list` | First-launch review + hash pinning is enough |
+| Operator allowlist promoting `optional` task tools | One policy axis is enough; only `required` becomes a task in v1 |
+| Eager `tasks/result` on jobs-panel open | Status-only by default; detail entry triggers result fetch |
+| `PostMessageTransport` deferred-target queue | Upstream-rejected; construction order is the fix |
+| Byte-for-byte `tasks/result` rehydration | Spec requires semantic equivalence, not serializer-byte equality |
 
 ## Background
 
@@ -214,8 +285,10 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
 - **Two-level negotiation.** Server advertises
   `capabilities.tasks.requests.tools.call`. Each tool independently
   declares `execution.taskSupport` as `forbidden`, `optional`, or
-  `required`. v1 task-augments only `required` tools or an explicit
-  operator allowlist.
+  `required`. v1 task-augments only `required` tools. `optional`
+  runs synchronously; `forbidden` runs synchronously. No operator
+  allowlist for promoting `optional` to task in v1 — that
+  introduces a second policy axis without user-visible benefit.
 - Status lifecycle relevant to v1: `working` → `completed` |
   `failed` | `cancelled`.
 - **`input_required` handling.** It's a non-terminal status the host
@@ -238,7 +311,16 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   observer (a mounted view, an open jobs panel, an active chat tab
   watching its task). When no observer exists, polling stops; the
   task continues server-side. On user return, the jobs panel uses
-  `tasks/list` + `tasks/get` to refresh state.
+  `tasks/list` + `tasks/get` to refresh state and surfaces TTL.
+- **Jobs panel is status-only by default.** Opening the panel
+  does **not** call `tasks/result` for terminal rows. It loads
+  task state with `tasks/list` / `tasks/get`, displays status and
+  TTL, and only calls `tasks/result` on (a) explicit detail
+  entry, (b) a "wait for result" action on an in-flight task, or
+  (c) opportunistic save when a subscribed task transitions to
+  terminal while the user is present. This keeps panel-open
+  cheap on accounts with many completed tasks and respects
+  TTL-bound result retention.
 - **`tasks/cancel` after terminal status.** The spec requires the
   receiver to **reject** with `-32602` invalid params. v1 client
   honors that — the running-jobs cancel button is disabled in
@@ -257,14 +339,20 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
     underlying request's result envelope has no `taskId` of its own.
 - **Result fidelity.** `tasks/result` returns the same successful
   result or JSON-RPC error the underlying request would have
-  produced. v1 stores **canonical JSON envelopes** preserving enough
-  metadata to reconstruct the semantic response. Oversized payloads
-  (>~12 MiB to leave headroom under the 16 MiB BSON limit) and
-  binary-heavy blobs offload to immutable blob storage.
-  **Pointerization is an internal storage detail.** When responding
-  to `tasks/result`, the host rehydrates the original response shape
-  byte-equivalent to what the original request would have returned —
-  it does not return host-invented URL/hash structures to the caller.
+  produced, with `_meta` preserved (see view-path rules in the
+  Data boundary section). v1 stores **canonical JSON envelopes**
+  preserving enough metadata to reconstruct the semantic response.
+  Oversized payloads (>~12 MiB to leave headroom under the 16 MiB
+  BSON limit) and binary-heavy blobs offload to immutable blob
+  storage. **Pointerization is an internal storage detail.** When
+  responding to `tasks/result`, the host rehydrates the original
+  response shape so it is **semantically equivalent** to what the
+  original request would have returned — same JSON-RPC envelope
+  type (result vs error), same parsed structure for `content` /
+  `structuredContent`, same `_meta`. Byte-for-byte equality of
+  serializer output (key order, whitespace, spacing) is not
+  required; structural and semantic equivalence is. Pointerized
+  blob references must not leak into the caller-visible payload.
 - Status notifications are optional; `pollInterval` is advisory; the
   host treats both as hints.
 - Servers may return
@@ -295,20 +383,26 @@ Reference:
 | MCP server management UI | Done | `client/src/components/SidePanel/MCPBuilder/` |
 | Sandboxed iframe UI rendering (mcp-ui ad-hoc) | Done | `client/src/components/MCPUIResource/` via `@mcp-ui/client` |
 | Sampling / elicitation | Missing | blocks `input_required` |
-| Streamable HTTP reliability (307/308, session reuse, immediate-disconnect) | Buggy — Phase 0 | transport layer |
-| Per-user header/token scoping (recent advisory) | Hardening required | transport layer |
-| Apps capability negotiation | Missing | — |
+| 307/308 redirect handling on Streamable HTTP | Done on `main` | transport layer |
+| Cross-origin credential stripping on redirects | Done on `main` | transport layer |
+| Streamable HTTP session reuse correctness, header consistency, 404 → re-init | Phase 0 | transport layer |
+| Per-user header/token scoping (recent advisory) | Phase 0 | transport layer |
+| Apps capability negotiation (gated by `MCP_APPS_ENABLED`) | Missing | — |
 | `_meta.ui.resourceUri`-driven discovery (server-side) | Missing | — |
 | Cross-origin sandbox proxy + stable wire-format flow | Missing | — |
-| `AppBridge` wrapper with explicit-origin transport shim | Missing | — |
+| `AppBridge` wrapper with explicit-origin transport shim, lazy-loaded on client | Missing | — |
+| Host construction-order invariant for `srcdoc` race | Missing | — |
+| Per-view nonce binding for relayed inbound messages | Missing | — |
 | `ui/initialize` handshake + truthful `hostContext` (full surface) | Missing | — |
 | Single-ACL forwarded-method enforcement (incl. cross-server isolation) | Missing | — |
 | First-launch resource review (server-side) + hash pinning + asset-URL validator | Missing | — |
 | Per-resource CSP via `<meta>` injection | Missing | — |
+| Sizing fallback height + `shrinkWrap: false` opt-out | Missing | — |
 | Trust UX (sandbox boundary chrome) | Missing | — |
-| MCP Tasks (per-tool negotiation, active-subscriber polling, auth-context binding, canonical-envelope persistence with shape rehydration) | Missing | — |
+| MCP Tasks (per-tool negotiation, active-subscriber polling, auth-context binding, canonical-envelope persistence with semantic-equivalence rehydration) | Missing | — |
+| Tasks capability negotiation (gated by `MCP_TASKS_ENABLED`) | Missing | — |
 | `model-immediate-response` runtime behavior | Missing | — |
-| Background task UI (running-jobs surface, cursor-paginated) | Missing | — |
+| Status-only running-jobs UI (cursor-paginated; `tasks/result` on detail entry) | Missing | — |
 
 ## Workspace boundaries (per CLAUDE.md)
 
@@ -323,10 +417,19 @@ Reference:
 ## Capability advertisement and version gating
 
 LibreChat advertises each capability only after its end-to-end
-implementation passes the relevant interop matrix.
+implementation passes the relevant interop matrix **and** its
+feature flag is on.
 
-- Apps capability turns on at the end of Phase 2.
-- Tasks capability turns on at the end of Phase 4.
+- **Independent feature flags.** `MCP_APPS_ENABLED` and
+  `MCP_TASKS_ENABLED` are independent operator settings; either
+  one can be on without the other. This decouples the Apps
+  (stable) release train from the Tasks (experimental) release
+  train so Tasks instability never blocks Apps shipping.
+- Apps capability turns on at the end of Phase 2 when
+  `MCP_APPS_ENABLED=true`.
+- Tasks capability turns on at the end of Phase 4 when
+  `MCP_TASKS_ENABLED=true`. Tasks may stay OFF through multiple
+  Apps minor releases.
 - `tasks.requests.*` published exhaustively for implemented
   directions only.
 - `hostCapabilities` and `hostContext.availableDisplayModes` are
@@ -347,30 +450,83 @@ implementation passes the relevant interop matrix.
   shim around `PostMessageTransport`'s receive logic that sends with
   **explicit target origins** instead of the SDK default of `*`. The
   SDK's `event.source` and JSON-RPC envelope validation is preserved.
+- **Lazy-loaded on the client.** `AppBridge` and the transport
+  pull Zod and add ~377 KB minified to the bundle. They are
+  imported on-demand only when the first Apps view in a session
+  is about to mount. The default chat bundle does not pay for
+  Apps when no app is in use.
 - **Wire flow:**
   1. Proxy emits `ui/notifications/sandbox-proxy-ready`.
   2. Host fetches the resource server-side via `resources/read`,
      runs the resource through the review pipeline (asset-URL
      validation, hash check, CSP synthesis), and sends
      `ui/notifications/sandbox-resource-ready` with
-     `{ html, sandbox, csp, permissions }`.
+     `{ html, sandbox, csp, permissions, nonce }`. The
+     128-bit `nonce` is per-view and host-generated; the proxy
+     stamps it on every relayed message into the host.
   3. Proxy creates an inner iframe with `srcdoc=html`, host-filtered
      `sandbox` flags, and `allow=<filtered permissions>`.
   4. The view runs the standard initialization handshake before the
      host sends `tool-input`, `tool-result`, etc.
 
+### Host construction order (invariant)
+
+The `srcdoc` initialization race is real: if the view's HTML loads
+before the host's postMessage listener is wired up, `ui/initialize`
+is dropped and the bridge silently hangs. Inside the proxy iframe,
+the **only** safe ordering for materializing the inner view is:
+
+1. Append the inner iframe element to the proxy's DOM.
+2. While its `contentWindow` is still the initial `about:blank`,
+   capture the reference.
+3. Construct and connect the host-side transport / message
+   listener against that reference.
+4. **Only now** assign `srcdoc` (or set `src`).
+
+The proxy implementation in `proxy.html` enforces this ordering;
+the host implementation enforces the analogous ordering for the
+outer proxy iframe. Both orderings are checked in Phase 1 tests
+and their correctness is a Phase 1 exit criterion. v6 explicitly
+rejects the alternative of patching `PostMessageTransport` with a
+deferred-target queue: upstream rejected that approach because it
+turns a forgotten `setTarget` into a silent hang and widens the
+trust boundary by accepting messages before the source is pinned.
+
 ### `postMessage` validation
 
 - Senders specify exact target origins (no `*`).
-- Receivers validate `event.origin` against an exact allowlist (no
-  partial / suffix match), `event.source` against expected window
-  refs where applicable, and the JSON-RPC envelope schema before
-  dispatch.
+- Receivers validate **all four** of:
+  - `event.origin` against an exact allowlist (no partial /
+    suffix match).
+  - `event.source` against the expected window reference where
+    available.
+  - JSON-RPC envelope schema.
+  - **Per-view nonce** (see below) on every relayed inbound
+    message.
 - Sandboxed `null` origins accepted only when the source matches the
-  proxy-controlled inner window.
+  proxy-controlled inner window **and** the nonce matches.
+- **Per-view nonce.** A 128-bit nonce is generated per view and
+  delivered to the proxy on `ui/notifications/sandbox-resource-
+  ready`. The proxy attaches it to every relayed inbound message
+  before forwarding to the host. The host treats nonce mismatch as
+  fatal and tears down the view. Reason: WebKit/Safari is known to
+  surface `event.source === window` for sandbox-relayed messages
+  (upstream issue), which makes raw source-identity matching
+  unreliable on that engine. Nonce binding makes inner-frame trust
+  not depend on `event.source` alone.
 - Initialization barrier: outbound host requests are queued until
   both `ui/initialize` response is sent and the view's
   `ui/notifications/initialized` is received.
+
+### Browser support stance
+
+- Chromium and Firefox are supported in v1; the relay
+  source-identity behavior matches host expectations.
+- Safari/WebKit is supported in v1 **only if** the nonce-bound
+  relay passes the Phase 1 cross-engine interop matrix. If it
+  fails, Safari is documented as unsupported for Apps until the
+  upstream relay issue is resolved, and the host falls back to
+  the legacy text-only path on detected Safari.
 
 ### Iframe sandbox flags (hardened defaults)
 
@@ -485,21 +641,74 @@ rather than a runtime mystery.
   the download.
 - `ui/download-file` is out of v1.
 
+### Sizing and `containerDimensions`
+
+- The Apps spec requires hosts using flexible dimensions to listen
+  for `ui/notifications/size-changed` and surface
+  `containerDimensions` via `HostContext`. v1 does both.
+- **Initial-render fallback.** Upstream is still carrying a fix
+  for default auto-resize collapsing common `height: 100%`
+  layouts on first render. To avoid a "view appears as a sliver"
+  failure mode in v1, the host applies a fallback height
+  (default 320 px, configurable via
+  `MCP_APPS_FALLBACK_HEIGHT_PX`) until the first non-zero
+  `size-changed` notification arrives. Width follows the host
+  container.
+- **Aggressive shrink-wrap opt-out.** A per-server
+  operator setting (`shrinkWrap: false`) disables auto-shrink
+  behavior entirely and pins the view at the fallback height; the
+  view can still grow through `size-changed`. This is the safe
+  setting for app authors whose layouts are known to misbehave
+  with the SDK's default measurement.
+- `host-context-changed` fires when the user resizes the host
+  shell so the view sees fresh `containerDimensions`.
+
 ## Data boundary rules
 
-- **`content`** on a tool result → conversation context
-  (model-visible).
-- **`structuredContent`** → UI rendering only. Never added to model
-  context, never persisted into model-visible payloads.
-- **`_meta`** → not for model context.
-- **`ui/update-model-context`** → the latest update before the next
-  user message is folded into model context. Earlier updates are
-  discarded.
-- Task results follow the same rules.
-- The agent loop, persistence layer, and rehydration / replay path
-  share a single helper that strips non-model fields before model
-  exposure. Tests assert that `structuredContent` and `_meta` never
-  appear in any model-bound serialization.
+A `CallToolResult` (or rehydrated `tasks/result` envelope) flows
+along **two distinct paths** with opposite preservation rules.
+
+### Model path (host → LLM)
+
+- **`content`** is the only model-visible surface and goes into
+  conversation context.
+- **`structuredContent`** is stripped before model exposure.
+  Never added to model context, never persisted into
+  model-visible payloads.
+- **`_meta`** is stripped before model exposure.
+- **`ui/update-model-context`** layers on top: the latest update
+  before the next user message is folded into model context;
+  earlier updates are discarded.
+
+### View path (host → app view)
+
+- The host **must** forward the full `CallToolResult` to the view
+  via `ui/notifications/tool-result`, including `content`,
+  `structuredContent`, **and `_meta`**. The Apps spec defines the
+  payload as a standard `CallToolResult`, not a host-sanitized
+  subset.
+- `_meta["io.modelcontextprotocol/related-task"]` must reach the
+  view intact for Tasks correlation; dropping it breaks
+  task-aware Apps.
+- Server-defined `_meta` keys outside the reserved namespace must
+  also be preserved so app authors can rely on them.
+- The same rule applies to `tasks/result` rehydration on the view
+  path: the rehydrated envelope keeps its `_meta`, including
+  `related-task`.
+
+### Implementation invariant
+
+Two helpers, not one:
+
+- `toModelView(result)` — strips `structuredContent` and `_meta`
+  for model context, persistence into model-visible payloads, and
+  replay/rehydration on the model side.
+- `toViewSurface(result)` — preserves the full envelope for
+  bridge delivery and view-side rehydration.
+
+Tests assert both directions: `structuredContent` and `_meta`
+never appear in model-bound serialization, **and** they always
+appear in view-bound serialization when the server provided them.
 
 ## Resource review (server-side)
 
@@ -532,33 +741,59 @@ rather than a runtime mystery.
 
 ## Security and transport prerequisites (Phase 0)
 
-Phase 0 is gating both Apps and Tasks:
+Phase 0 is gating both Apps and Tasks but is narrower in v6 than
+in earlier revisions. Public `main` already lands manual 307/308
+redirect handling and strips credential-bearing headers
+(`authorization`, `cookie`, `mcp-session-id`) on cross-origin
+redirects. Phase 0 focuses only on what remains:
 
-- Resolve documented Streamable HTTP issues (immediate-disconnect,
-  307/308 redirect handling), wire `MCP-Session-Id` reuse and
-  `MCP-Protocol-Version` headers consistently, implement HTTP 404
-  → new MCP session with outstanding-task revalidation.
-- Close per-user header/token scoping for shared server definitions
-  (the recent advisory). Define and enforce the
-  authorization-context tuple
-  `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`.
-- Operator policy defaults for server creation, transport
-  allowlists, per-user task quotas, result-size caps. Defaults lean
-  toward denial.
+- **Session-reuse correctness.** Verify `MCP-Session-Id` is
+  reused across requests within a session and rotated only on
+  re-initialize. Add tests for the cases public `main` doesn't
+  currently cover.
+- **Header consistency.** Ensure `MCP-Protocol-Version` and
+  `MCP-Session-Id` are sent on every request (initialize and
+  subsequent), and that they match what the server returned.
+- **HTTP 404 → re-initialize.** When a server returns 404 for a
+  session, the client opens a new MCP session and revalidates
+  outstanding `taskId`s via `tasks/get`. Tasks for which the
+  server returns "not found" become terminal-with-error.
+- **Per-user token scoping.** Close the recent advisory: shared
+  server definitions must not leak per-user tokens across users.
+  Define and enforce the authorization-context tuple
+  `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)` at
+  connection time and treat it as immutable for the connection's
+  lifetime.
+- **Operator policy defaults.** Defaults for server creation,
+  transport allowlists, per-user task quotas, result-size caps —
+  defaults lean toward denial.
+
+Items already landed on `main` are explicitly **not** Phase 0
+work in v6: 307/308 redirect handling and credential-stripping
+on cross-origin redirects. If diff against `main` reveals a gap,
+re-add it; otherwise treat them as done.
 
 ## Phased plan
 
-### Phase 0 — Transport reliability + auth-context substrate (≈1 week)
+### Phase 0 — Transport reliability + auth-context substrate (≈3–5 days)
 
-- Streamable HTTP fixes (redirects, session reuse, disconnect).
+- Session-reuse correctness across requests.
+- Consistent `MCP-Protocol-Version` / `MCP-Session-Id` headers.
+- HTTP 404 → re-initialize + outstanding-task revalidation.
+- Per-user token scoping closure.
 - Authorization-context tuple computed at connection time.
 - Operator policy defaults.
+
+(Reduced from the v5 estimate of ≈1 week because redirect
+handling and cross-origin credential stripping are already
+landed in public `main`.)
 
 ### Phase 1 — Types + sandbox infra + bridge wrapper (≈1 week)
 
 End of phase: sandbox origin serves static `proxy.html`; bridge
-handshake works against a fixture server; **no capability
-advertised**.
+handshake works against a fixture server; construction-order
+invariant verified across Chromium / Firefox (and Safari if it
+passes the relay-nonce matrix); **no capability advertised**.
 
 - Types in `packages/data-provider`, generated from the pinned
   ext-apps release.
@@ -568,10 +803,30 @@ advertised**.
   `MCP_SANDBOX_ORIGIN` with `frame-ancestors` CSP header.
 - Wrap `AppBridge`. Implement the explicit-origin transport shim
   around `PostMessageTransport`'s receive logic. Add
-  origin/source/schema validation in front of the SDK transport.
+  origin/source/schema/nonce validation in front of the SDK
+  transport.
+- **Lazy-load** the bridge runtime on the client; verify the
+  default chat bundle does not include `AppBridge` /
+  `PostMessageTransport` / Zod when no Apps view is mounted.
+- **Construction-order test**: a fixture proves that flipping
+  the order (`srcdoc` before listener attach) reliably reproduces
+  a dropped handshake, and the production code path always uses
+  the safe order.
+- **Cross-engine relay test (nonce binding)**: messages relayed
+  through the proxy round-trip with their per-view nonce; nonce
+  mismatch tears the view down. Run on Chromium, Firefox, and
+  WebKit/Safari.
 - `MCPResourceReview` collection scaffold + asset-URL validator.
 - Tests with `mongodb-memory-server` + real
   `@modelcontextprotocol/sdk` + Playwright cross-origin iframes.
+
+Phase 1 exit criteria:
+
+1. Construction-order test passes on every supported engine.
+2. Nonce-bound relay test passes on every engine that v1
+   intends to claim support for.
+3. Default chat bundle size does not regress by more than a
+   small known delta from `main` when Apps is not in use.
 
 ### Phase 2 — Apps v1 end-to-end + capability turn-on (≈2–3 weeks)
 
@@ -607,11 +862,22 @@ render inline with full HostContext.
   pinning; `MCPBuilder/` UI for approvals.
 - Trust UX chrome around every view.
 - Reject resources declaring `_meta.ui.domain` with a clear error.
-- Data-boundary helper plumbed through agent tool-result handling
-  and persistence; tests assert no `structuredContent`/`_meta`
-  leaks to the model.
-- **End of phase**: enable Apps capability advertisement, gated
-  by interop matrix passing.
+- **Two helpers, not one** for the data boundary
+  (`toModelView`, `toViewSurface`). Plumb both through agent
+  tool-result handling, persistence, and view delivery. Tests
+  assert (a) `structuredContent`/`_meta` never leak to the model
+  path, **and** (b) `_meta` (including
+  `io.modelcontextprotocol/related-task` and server-defined
+  keys) is preserved on the view path.
+- Sizing fallback: apply `MCP_APPS_FALLBACK_HEIGHT_PX` until the
+  first non-zero `size-changed`; honor the `shrinkWrap: false`
+  per-server opt-out.
+- **Apps feature flag** (`MCP_APPS_ENABLED`) added; OFF by
+  default until interop matrix passes. Toggle is independent of
+  Tasks.
+- **End of phase**: enable Apps capability advertisement when
+  `MCP_APPS_ENABLED=true` and interop matrix passes. Tasks may
+  still be OFF at this point.
 
 ### Phase 3 — `tool-input-partial` (≈1 week, optional)
 
@@ -626,14 +892,18 @@ for implemented directions.
 
 - `packages/api/src/mcp/`:
   - Honor per-tool `execution.taskSupport`. v1 task-augments only
-    `taskSupport: required` tools or operator allowlist.
+    `taskSupport: required` tools. `optional` runs synchronously;
+    `forbidden` runs synchronously. No operator-allowlist promotion
+    of `optional` to task.
   - **Active-subscriber polling.** Each subscriber (mounted view,
     open jobs panel, active conversation) owns its own poll
     against `tasks/get` while present. When no subscriber is
     observing, polling stops; the task continues server-side.
-    `tasks/result` is invoked only when the user is actively
-    waiting or opens a job detail. No background API-process
-    poller.
+    `tasks/result` is invoked only on explicit detail entry, a
+    "wait for result" action, or opportunistic save when a
+    subscribed task reaches terminal with the user present. No
+    background API-process poller. Opening the jobs panel never
+    eagerly fetches `tasks/result` for terminal rows.
   - **Subscriber registry is in-memory per connected session.**
     On reconnect, subscribers re-register and reload from
     `tasks/get`. No durable subscriber state.
@@ -647,10 +917,14 @@ for implemented directions.
     Payloads >12 MiB or binary-heavy blobs offload to immutable
     blob storage with the envelope referencing them by URL/hash.
   - **`tasks/result` rehydration**: on retrieval, the host
-    rehydrates the original response shape byte-equivalent to
-    what the original underlying request would have returned.
-    Pointerization is a storage detail and must not leak into the
-    response.
+    rehydrates the original response shape so it is
+    **semantically equivalent** to what the original underlying
+    request would have returned — same envelope type (result vs
+    error), same parsed structure for `content` /
+    `structuredContent`, and same `_meta` (incl. the
+    `related-task` tag). Byte-for-byte serializer equality is not
+    required. Pointerization is a storage detail and must not
+    leak into the response.
   - Strict related-task metadata rules:
     - Add on all task-related requests, notifications, and
       responses *except* on `tasks/get` / `tasks/result` /
@@ -691,7 +965,11 @@ for implemented directions.
   button (disabled for terminal and `input_required` states),
   deep-link to originating conversation. Localize under
   `com_ui_mcp_task_*`.
-- **End of phase**: enable Tasks capability advertisement.
+- **Tasks feature flag** (`MCP_TASKS_ENABLED`) added; OFF by
+  default. Independent of `MCP_APPS_ENABLED` so Apps may have
+  shipped already.
+- **End of phase**: enable Tasks capability advertisement when
+  `MCP_TASKS_ENABLED=true` and the Tasks interop matrix passes.
 
 ### Phase 5 — Hardening, browser matrix, ops docs (≈1 week)
 
@@ -774,6 +1052,25 @@ the user navigates.
 - **Asset URL strictness may reject otherwise-valid app bundles.**
   Document the rule clearly so app authors ship self-contained or
   absolute-HTTPS HTML.
+- **Safari/WebKit relay risk.** The upstream relay issue means
+  Safari requires the nonce-bound trust path to be solid. If
+  the Phase 1 cross-engine matrix fails on Safari, Safari is
+  documented as unsupported for Apps in v1, and the host falls
+  back to the legacy text-only path on detected Safari. This is
+  re-evaluated when upstream resolves the issue.
+- **TTL-bound result retention.** "Come back later and still see
+  the result" only holds while the server still retains it; TTL
+  is authoritative. The status-only-on-open jobs panel surfaces
+  TTL so users can see when a result will expire and choose to
+  fetch it before then.
+- **Default chat bundle size.** Lazy-loading `AppBridge` keeps
+  the bundle lean today, but a future change to non-Apps code
+  paths could accidentally re-import the bridge eagerly. The
+  bundle-size regression test guards against that.
+- **Sizing default behavior is still upstream-unstable.** The
+  fallback height policy and shrink-wrap opt-out are explicit
+  product surface so app authors can route around the SDK
+  default measurement until upstream lands a fix.
 - **`tool-input-partial`** requires `@librechat/agents` changes.
 - **Out-of-band notification** stays in the external system's
   domain via webhook → email; not solved by Tasks.
@@ -787,6 +1084,11 @@ the user navigates.
   server.
 - **ext-apps `main` drift.** Pinned release intentionally ignores
   draft additions. Quarterly refresh cadence.
+- **Phase 0 scope vs. private branch.** Phase 0 was sized
+  against public `main`. If the working branch contains
+  divergent transport changes that haven't been picked up here,
+  re-scope Phase 0 against that branch's actual diff before
+  starting.
 
 ## Testing matrix
 
@@ -796,11 +1098,16 @@ the cross-origin iframe layer.
 
 ### Phase 0
 
-- 307/308 redirect handling on Streamable HTTP.
-- `MCP-Session-Id` reuse across requests.
+- `MCP-Session-Id` reuse across requests within a session.
+- Consistent `MCP-Protocol-Version` / `MCP-Session-Id` headers
+  on every request.
 - HTTP 404 → new MCP session, outstanding-task revalidation.
+- Per-user token scoping for shared server definitions.
 - Authorization-context tuple captured at connection time and
   immutable across the connection's lifetime.
+- (Regression-only) 307/308 redirect handling and credential
+  stripping on cross-origin redirects: spot-check that public
+  `main` behavior has not regressed.
 
 ### MCP Apps
 
@@ -842,20 +1149,49 @@ the cross-origin iframe layer.
   host crash.
 - `postMessage` from wrong origin: rejected.
 - `null`-origin `postMessage` from sandbox: accepted only when
-  source matches the proxy-controlled inner window.
+  source matches the proxy-controlled inner window **and** the
+  per-view nonce matches.
 - **PostMessage transport shim**: outbound sends use exact target
   origins, never `*`.
+- **Construction-order invariant**: a fixture deliberately
+  flipping the order (set `srcdoc` before listener attach)
+  reproduces a dropped `ui/initialize`; production code path
+  attaches the listener first and the bridge initializes
+  reliably. Asserted on Chromium, Firefox, and (when supported)
+  WebKit/Safari.
+- **Cross-engine relay test (per-view nonce)**: every relayed
+  inbound message carries the per-view nonce; nonce mismatch
+  tears the view down with a clear error. Asserted on every
+  engine v1 claims to support.
+- **Bundle-size regression**: default chat bundle does not
+  include `AppBridge` / `PostMessageTransport` / Zod when no
+  Apps view is mounted.
+- **Sizing fallback**: with no `size-changed` notification, the
+  view renders at the operator-configured fallback height; once
+  a non-zero `size-changed` arrives the host honors it; the
+  `shrinkWrap: false` opt-out pins the view at the fallback
+  height even if the SDK suggests shrinking.
 - First-launch resource review: hash stored; divergent hash
   refused at next launch.
-- Data boundary: `structuredContent` and `_meta` never appear in
-  model-bound serialization, including across rehydration.
+- **Data boundary — model path**: `structuredContent` and
+  `_meta` never appear in model-bound serialization, including
+  across rehydration.
+- **Data boundary — view path**: `_meta` (including
+  `io.modelcontextprotocol/related-task` and server-defined
+  keys outside the reserved namespace) is preserved on
+  `ui/notifications/tool-result` to the view, and on
+  view-path `tasks/result` rehydration.
 
 ### MCP Tasks
 
 - Per-tool `taskSupport: required` rejects synchronous calls.
 - Per-tool `taskSupport: forbidden` rejects task-augmented calls.
-- v1 augmentation policy: only `required` (or operator
-  allowlist) tools become tasks; `optional` runs synchronously.
+- v1 augmentation policy: only `required` tools become tasks;
+  `optional` and `forbidden` run synchronously. No operator
+  allowlist promotes `optional` to task.
+- **Independent feature flags**: `MCP_APPS_ENABLED` ON +
+  `MCP_TASKS_ENABLED` OFF advertises Apps capability without
+  Tasks capability; the inverse also works.
 - **`tasks/result` response carries `related-task` meta**.
 - `tasks/get`/`result`/`cancel` requests with the meta present:
   receiver ignores meta, uses param.
@@ -866,8 +1202,15 @@ the cross-origin iframe layer.
   mounted; stops when observer leaves; resumes on return.
 - **No background poller**: with no subscribers, no
   `tasks/get` traffic is generated.
-- User opens jobs panel → `tasks/result` fires for terminal
-  tasks; `tasks/get` resumes for in-flight tasks.
+- **Jobs panel is status-only on open**: opening the panel calls
+  `tasks/list` + `tasks/get` to refresh state and TTL, and does
+  **not** call `tasks/result` for any row.
+- **Detail entry triggers `tasks/result`**: opening a terminal
+  task's detail row, or clicking "wait for result" on an
+  in-flight task, calls `tasks/result` exactly once.
+- **Opportunistic save**: a task subscribed by an active observer
+  that transitions to terminal while the user is present
+  triggers a single `tasks/result` and the result is persisted.
 - Disconnect during polling → subscriber resubscribes after
   reconnect via `tasks/list` + `tasks/get`.
 - HTTP 404 for `MCP-Session-Id` → new session, outstanding
@@ -879,10 +1222,13 @@ the cross-origin iframe layer.
 - Authorization-context binding: `tasks/list` from a different
   context returns empty; `tasks/get` for another context's task
   returns not-found.
-- **`tasks/result` rehydration**: response shape byte-equivalent
-  to original request's; pointerized blob offloads rehydrated
+- **`tasks/result` rehydration**: response is semantically
+  equivalent to the original request's — same envelope type
+  (result vs error), same parsed structure, `_meta` preserved
+  including `related-task`. Pointerized blob offloads rehydrated
   back to inline shape (or original CallToolResult linkage)
-  before responding.
+  before responding. Byte-for-byte serializer equality is not
+  asserted.
 - **`input_required` runtime**:
   - Server transitions a task to `input_required`.
   - Host preserves `status: "input_required"` and sets
@@ -896,14 +1242,19 @@ the cross-origin iframe layer.
 
 | Phase | Estimate |
 |---|---|
-| 0 — Transport reliability + auth-context substrate | 1 week |
-| 1 — Types + sandbox infra + bridge wrapper | 1 week |
+| 0 — Transport reliability + auth-context substrate | 3–5 days |
+| 1 — Types + sandbox infra + bridge wrapper (incl. construction-order + nonce relay tests) | 1 week |
 | 2 — Apps v1 end-to-end + full HostContext + capability turn-on | 2–3 weeks |
 | 3 — `tool-input-partial` (optional) | 1 week (risk) |
 | 4 — MCP Tasks v1 (parallel with 2) | 2 weeks |
 | 5 — Hardening + browser matrix + ops docs | 1 week |
-| **Total (serial, excl. parallelism)** | **~6–8 weeks** |
-| **Phases 0 + 1 + 2 + 4** (functional CAD app, Tasks v1) | **~4–5 weeks** |
+| **Total (serial, excl. parallelism)** | **~5.5–7.5 weeks** |
+| **Phases 0 + 1 + 2** (Apps shipped, Tasks deferred) | **~3.5–4.5 weeks** |
+| **Phases 0 + 1 + 2 + 4** (functional CAD app, Tasks v1) | **~3.5–5 weeks** |
+
+The **Apps-only** track is now a first-class option because Apps
+and Tasks are gated by independent feature flags. If Tasks slips
+past v1 cut, Apps still ships.
 
 ## References
 
