@@ -3,9 +3,144 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v7 — closes the asset-supply-chain contradiction,
-adds a remount artifact, splits relay trust hop-by-hop, and ties
-host result retention to upstream TTL after the sixth review:
+**Revision:** v8 — closes the null-origin networking contradiction,
+binds approval to a canonical launch manifest, retires the legacy
+permissive renderer when Apps are enabled, adds concrete
+operational limits, nails down content decoding, and folds the
+relay probe into `ui/initialize` after the seventh review:
+
+- **No direct browser networking in v1.** With the inner iframe
+  sandboxed without `allow-same-origin`, the browser serializes
+  its origin as `null`. With `_meta.ui.domain` rejected in v1,
+  there is no stable origin to offer to app servers either.
+  Continuing to honor `_meta.ui.csp.connectDomains` for
+  `connect-src` while denying both same-origin and a stable
+  domain is trying to have it both ways: it works for some
+  open public endpoints, but fails on conservative CORS,
+  cookies, OAuth callbacks, and origin-bound API allowlists.
+  v8 cuts direct browser networking entirely. The default
+  inner-view CSP is `connect-src 'none'`. App authors route
+  network access through MCP `tools/call`, `resources/read`,
+  and `ui/open-link`, all of which the host proxies and
+  governs. `_meta.ui.csp.connectDomains` is **ignored** in v1
+  for asset loading **and** for `connect-src` synthesis. The
+  field stays in the parser so v2 can consider re-introducing
+  it once a stable-origin story (e.g. `_meta.ui.domain`,
+  per-instance subdomain delegation, or signed-token request
+  proxying) exists.
+- **Approval binds to a launch manifest, not just HTML bytes.**
+  v7's `approvedHash = sha256(html)` is too narrow: a server
+  can keep HTML stable while broadening permissions or CSP
+  posture. v8 introduces a canonical
+  `MCPAppLaunchManifest` whose hash covers the decoded HTML,
+  the host-filtered effective sandbox flags, the effective
+  iframe `allow` permissions, the effective network policy
+  (`connect-src` set, navigation allowlist intersection), the
+  resource URI, and a host trust-policy version. Both
+  `MCPResourceReview.manifestHash` and
+  `MCPAppInstance.manifestHash` use this. Divergence on any
+  policy axis triggers re-approval.
+- **Legacy `UIResourceRenderer` path is gated, not bypassed.**
+  Public `main` ships
+  `client/src/components/MCPUIResource/MCPUIResource.tsx` using
+  `UIResourceRenderer` from `@mcp-ui/client` with
+  `sandboxPermissions: 'allow-popups'`, reachable from chat,
+  share, and search views. v7 silently introduced a stricter
+  Apps path next to it, leaving a permissive renderer in
+  production. v8 makes the migration explicit:
+  - When `MCP_APPS_ENABLED=true`, the legacy path is
+    **disabled across all surfaces** (chat, share, search,
+    plugin-rendered messages). Tools that declare
+    `_meta.ui.resourceUri` route through the new Apps path;
+    everything else falls back to the existing text
+    rendering, not to the legacy renderer.
+  - When `MCP_APPS_ENABLED=false`, the legacy path stays as
+    today (operators who haven't migrated keep their current
+    behavior), but its `allow-popups` default is replaced by
+    a deny-by-default `sandboxPermissions: ''` and a banner
+    pointing to the Apps migration.
+  - There is no mode where both paths are active for the
+    same message.
+- **Concrete operational limits.** v7 left these to "decide
+  during implementation." v8 fixes defaults so the security
+  surface is bounded:
+  - `MCP_APPS_MAX_HTML_BYTES`: 2 MiB (rejected at review).
+  - `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW`: 8 MiB (forwarded
+    `tool-result` payload to a view; larger results are
+    truncated on the view path with a clear marker; the model
+    path still sees `content` truncated separately under its
+    own existing rules).
+  - `MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES`: 12 MiB inline; over
+    that, blob-offload (already in plan) kicks in.
+  - `MCP_APPS_TEARDOWN_WAIT_MS`: 1500 ms — the host waits for
+    `ui/resource-teardown` response before forcibly removing
+    the iframe, then removes regardless.
+  - `MCP_APPS_VIEW_RPC_RATE_PER_MIN`: 600 inbound JSON-RPC
+    messages per view per minute; over that, the view is
+    paused with a clear chrome message.
+  - `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN`: 1200 inbound
+    notifications per view per minute (covers `ping`,
+    `notifications/message`, `size-changed` echoes, etc.).
+  - `authContextHash` is `sha256(canonicalJSON(authPayload))`
+    where `authPayload` is the normalized config (see Auth
+    canonicalization below).
+- **Content decoding and MIME validation are explicit.** UI
+  resources can arrive as `text` or base64 `blob` per the
+  Apps spec, with MIME `text/html;profile=mcp-app`. v8's
+  review pipeline runs in this order:
+  1. Reject if `mimeType` is missing or does not equal
+     `text/html;profile=mcp-app` (parameter order
+     normalized).
+  2. Decode the payload: `text` is taken verbatim; `blob` is
+     base64-decoded under the `MCP_APPS_MAX_HTML_BYTES`
+     limit and UTF-8 validated.
+  3. Reject multi-content responses (only one item per
+     `resources/read`).
+  4. Run the self-contained-HTML validator on the decoded
+     bytes.
+  5. Compute the launch-manifest hash.
+- **Relay self-test folds into `ui/initialize`.** v7 invented
+  a separate ping path. v8 deletes it. The first relayed
+  `ui/initialize` is the test: if the host receives a
+  schema-valid initialize through the proxy with a
+  proxy-stamped per-view nonce within a fixed timeout, the
+  mount passes. If the timeout elapses or validation fails,
+  the host tears down the iframe and falls back to text-only
+  for that mount. Same end-to-end coverage, one fewer
+  protocol surface.
+- **Trust chrome is mandatory.** `_meta.ui.prefersBorder=false`
+  is **ignored** in v1. Every Apps view renders inside a
+  host-controlled border with persistent identity chrome
+  (server, OAuth scopes, manifest hash short-prefix). The
+  Apps spec recommends clear sandbox boundaries; in chat
+  transcripts, removing them buys very little UX value and
+  weakens the trust boundary. Re-evaluate when there is a
+  stronger provenance and permissions surface.
+- **Drop opportunistic terminal-result persistence.** v7
+  allowed the host to fetch `tasks/result` whenever a
+  subscribed task transitioned to terminal while the user
+  was present. v8 cuts that. `tasks/result` is invoked only
+  on **(a) explicit detail entry** or **(b) explicit "wait
+  for result"** — nothing else. This eliminates a hidden
+  retention layer, simplifies the cache, removes a class of
+  rate-limit interactions, and matches the spec's normative
+  status path (`tasks/get` polling) more cleanly. If a user
+  watches a task to completion in a mounted view, the view
+  itself still receives the underlying tool result via the
+  bridge; the host does not need to re-fetch it.
+- **Outer-proxy sandbox flags pinned.** v8 makes the split
+  with the inner iframe explicit so reviewers don't conflate
+  them. The outer `MCP_SANDBOX_ORIGIN` proxy iframe runs with
+  `sandbox="allow-scripts allow-same-origin"` (required by
+  the Apps spec for proxy hosts). The inner app iframe runs
+  with the v6/v7 hardened flag set and **never** `allow-
+  same-origin`. These are two different policies on two
+  different frames at two different origins.
+- **`MCPAppInstance` stays narrow.** It re-instantiates an
+  approved view; it is not a generic state-management
+  store. Apps that want durable view state keep it on their
+  MCP server. v8 makes this explicit because the artifact's
+  scope is the place such a store would otherwise creep in.
 
 - **v1 approves bytes, not origins.** v6 left a contradiction:
   the plan claimed "browser receives an already-approved
@@ -185,26 +320,37 @@ Carried forward (still in force):
 - Active-subscriber polling only; no API-process background
   poller; no durable subscriber registry.
 - `_meta.ui.domain` unsupported in v1; single `MCP_SANDBOX_ORIGIN`.
+- Self-contained HTML only; v1 approves bytes, not origins.
 - PostMessage transport wrapper around `AppBridge` sends to
   explicit target origins; preserves SDK receive validation.
 - Iframe sandbox hardened defaults; `ui/open-link` is the only
   navigation escape hatch.
+- Hop-specific relay validation; host rejects `null` origin;
+  proxy-stamped per-view nonce.
 - Single ACL for all forwarded MCP methods; cross-server
   forwarding impossible by construction.
 - Resource fetch/hash/review is server-side; browser receives
-  already-approved payloads (now genuinely true under v7's
-  self-contained-HTML rule).
+  already-approved payloads (genuinely true under the
+  self-contained-HTML rule, and now extended to a launch
+  manifest).
 - `ui/message` is `user`-only per generated stable schema.
 - CAD example persists artifact handle, not presigned URL.
 - Independent feature flags: `MCP_APPS_ENABLED`,
   `MCP_TASKS_ENABLED`.
+- One outer sandbox proxy iframe per app instance; no pooling.
 - Host construction-order invariant.
 - Model-path vs view-path data boundary; `_meta` preserved on
   the view path.
-- Status-only jobs panel; `tasks/result` on detail entry.
+- Status-only jobs panel; `tasks/result` on detail entry or
+  explicit wait — nothing else.
 - Lazy-loaded `AppBridge` runtime on the client.
 - Sizing fallback height + `shrinkWrap: false` opt-out.
+- `MCPAppInstance` artifact for remount; not a state store.
+- Local task-result cache bounded by `createdAt + ttl`;
+  `MCPTask` is a cache, not durable storage.
 - Tasks-only over Streamable HTTP.
+- Outstanding-task revalidation on HTTP 404 lives in Phase 4
+  (Tasks-specific), not Phase 0.
 - Phase 3 (`tool-input-partial`) remains optional and post-v1.
 
 ## Goal
@@ -234,9 +380,10 @@ Tasks v1.
    of v1.
 3. **Tasks ownership model.** v1 is **active-subscriber polling**:
    `tasks/get` runs only while a chat tab, mounted view, or jobs
-   panel is observing. `tasks/result` is invoked only when the user
-   is actively waiting or has explicitly opened a job's detail view.
-   No background API-process poller, no durable subscriber registry.
+   panel is observing. `tasks/result` is invoked **only** on
+   explicit detail entry or explicit "wait for result" — there is
+   no opportunistic terminal-result fetch. No background
+   API-process poller, no durable subscriber registry.
 4. **Authorization context identifier.** v1 binds task ownership
    to a stable `authContextHash` over the normalized effective
    auth configuration at task creation: `userId`, `mcpServerId`,
@@ -255,12 +402,39 @@ Tasks v1.
    images permitted, and **no** `<script src>`, `<link href>`,
    `<img src>` to remote origins, **no** `<base>`. The review
    pipeline rejects any external-asset reference at review time.
-   `_meta.ui.csp.resourceDomains` is **ignored** for asset
-   loading in v1 — the resource cannot load remote assets, so
-   the field has nothing to permit. `connectDomains` is still
-   honored for `connect-src`. This makes hash pinning meaningful
-   and lets us truthfully claim the browser receives an
-   already-approved payload.
+   `_meta.ui.csp.resourceDomains` is **ignored** in v1.
+6a. **Network policy: no direct browser networking in v1.**
+    The default inner CSP has `connect-src 'none'`. Apps cannot
+    call out via `fetch`, XHR, or WebSocket from the view JS.
+    `_meta.ui.csp.connectDomains` is **also ignored** in v1;
+    the field is parsed but never installed in the runtime CSP.
+    All app-driven network access flows through the bridge:
+    `tools/call`, `resources/read`, and `ui/open-link`. The
+    rationale is that without `allow-same-origin` and without
+    `_meta.ui.domain`, the inner frame's network identity is
+    `null`, which interacts badly with conservative CORS,
+    cookies, OAuth, and origin-based API allowlists. Re-
+    introducing `connect-src` from server metadata is post-v1
+    and depends on a stable-origin design.
+6b. **Approval is over a launch manifest, not just HTML.**
+    `manifestHash` is the canonical hash over: decoded HTML,
+    host-filtered effective sandbox flags, effective iframe
+    `allow` permissions, effective network policy
+    (`connect-src` set, navigation allowlist intersection),
+    `resourceUri`, and host trust-policy version. Both review
+    and remount records bind to it. Divergence on any policy
+    axis (not just bytes) triggers re-approval.
+6c. **Content decoding pipeline.** `resources/read` results
+    are decoded in this fixed order: validate
+    `mimeType === "text/html;profile=mcp-app"` (parameter
+    order normalized); decode `text` verbatim or
+    base64-decode `blob` under `MCP_APPS_MAX_HTML_BYTES`;
+    UTF-8 validate; reject multi-content responses; run the
+    self-contained-HTML validator; compute `manifestHash`.
+6d. **Trust chrome is mandatory.** `_meta.ui.prefersBorder`
+    is **ignored** in v1; every Apps view renders inside a
+    persistent host-controlled border with identity chrome
+    (server, OAuth scopes, manifestHash short-prefix).
 7. **PostMessage transport.** v1 wraps `AppBridge` from
    `@modelcontextprotocol/ext-apps` with a thin transport that sends
    to **explicit target origins** instead of the SDK transport's
@@ -298,23 +472,77 @@ Tasks v1.
     pooling, no multiplexing in v1. Routing, teardown, audit,
     source pinning, and failure handling all simplify; no
     user-visible downside.
-12. **Browser support is decided by runtime probe.** A
-    per-mount relay self-test (host → proxy → inner →
-    proxy → host with the per-view nonce) runs during
-    initialization. If it fails, the host falls back to the
-    legacy text-only path for that mount with a clear chrome
-    message. There is no user-agent allow/deny list.
-13. **Persistent app-instance artifact for remount.** A new
-    `MCPAppInstance` record carries
+12. **Browser support is decided by runtime probe folded into
+    `ui/initialize`.** There is **no** separate ping path. The
+    first relayed `ui/initialize` is the test: the host
+    starts a fixed timeout once `sandbox-resource-ready` is
+    sent; if a schema-valid initialize arrives through the
+    proxy with a valid proxy-stamped per-view nonce before
+    the timeout, the mount passes. Otherwise the host tears
+    down the iframe and falls back to text-only for that
+    mount. There is no user-agent allow/deny list.
+13. **Persistent app-instance artifact for remount (narrow).**
+    A new `MCPAppInstance` record carries
     `(conversationId, messageId, mcpServerId, toolName,
-    resourceUri, approvedHash, createdAt)` so re-opening a
-    conversation can replay the host lifecycle around an
-    already-approved resource without inflating model context.
-    View-internal state is not preserved (spec defers this).
+    resourceUri, manifestHash, authContextHash, createdAt,
+    lastSeen)` so re-opening a conversation can replay the
+    host lifecycle around an already-approved manifest
+    without inflating model context. View-internal state
+    (selection, scroll, in-flight SPA navigation) is **not**
+    preserved; the artifact is intentionally narrow and is
+    not a state-management store. Apps that need durable view
+    state keep it on their MCP server.
 14. **Host-cached task results expire at upstream TTL.** Any
     locally cached `tasks/result` payload expires no later
     than `createdAt + ttl` as reported by the server.
     Persistence beyond upstream TTL is post-v1.
+15. **Legacy `UIResourceRenderer` path is gated, not bypassed.**
+    When `MCP_APPS_ENABLED=true`, the existing
+    `client/src/components/MCPUIResource/MCPUIResource.tsx`
+    path (and any other surface that mounts
+    `@mcp-ui/client`'s `UIResourceRenderer`) is **disabled
+    everywhere it can render** — chat, share, search,
+    plugin-rendered messages. Tools with
+    `_meta.ui.resourceUri` route through the new Apps path;
+    other UI resources fall back to text. When
+    `MCP_APPS_ENABLED=false`, the legacy path stays as
+    today, but its `sandboxPermissions` default is changed
+    from `'allow-popups'` to `''` and a chrome banner points
+    operators at the migration. There is no mode where both
+    paths render the same message.
+16. **Outer-proxy vs inner-iframe sandbox split.** The outer
+    sandbox-proxy iframe (loads `proxy.html` from
+    `MCP_SANDBOX_ORIGIN`) runs with
+    `sandbox="allow-scripts allow-same-origin"` per the
+    Apps spec's host-side requirements for proxies. The
+    **inner** iframe (the app view, rendered via `srcdoc`)
+    runs with the v6/v7 hardened flag set and **never**
+    `allow-same-origin`. These are two different policies
+    on two different frames at two different origins.
+17. **Operational limits (defaults, operator-tunable).**
+    - `MCP_APPS_MAX_HTML_BYTES = 2 MiB` (review reject).
+    - `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW = 8 MiB`
+      (view-path truncation with marker; model path
+      truncated separately).
+    - `MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES = 12 MiB` inline
+      (above triggers blob offload).
+    - `MCP_APPS_TEARDOWN_WAIT_MS = 1500`.
+    - `MCP_APPS_VIEW_RPC_RATE_PER_MIN = 600` (request
+      throttle per view).
+    - `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN = 1200`
+      (notification throttle per view).
+    - `MCP_APPS_INITIALIZE_TIMEOUT_MS = 5000` (the relay
+      probe fold-in deadline).
+18. **`authContextHash` canonicalization.** Compute as
+    `sha256(canonicalJSON(authPayload))` where
+    `canonicalJSON` is RFC 8785 JCS-equivalent (sorted
+    keys, no whitespace, no insignificant differences) and
+    `authPayload = { userId, mcpServerId, credentialSource,
+    headerAuthFingerprint, configRevision }`. All five
+    fields are required; missing fields are explicit
+    `null` so the hash distinguishes "absent" from
+    "empty". The function lives in `packages/api` and has
+    a dedicated unit-test corpus.
 
 ## Pinned protocol versions
 
@@ -348,10 +576,17 @@ v1 rejects non-`user` roles with a clear error.
 | `ui/message` with non-`user` roles | Stable schema is `user`-only |
 | External assets in resource HTML (relative or absolute) | v1 approves bytes, not origins; HTML must be self-contained |
 | `_meta.ui.csp.resourceDomains` / `frameDomains` / `baseUriDomains` | Corresponding HTML constructs forbidden in v1 |
+| `_meta.ui.csp.connectDomains` | No direct browser networking in v1; route via `tools/call` / `resources/read` / `ui/open-link` |
+| Direct in-app `fetch` / XHR / WebSocket | Inner-frame origin is `null`; no stable origin for CORS / cookies / OAuth in v1 |
+| `_meta.ui.prefersBorder = false` | Trust chrome is mandatory in v1 |
+| Opportunistic terminal-result persistence in Tasks | Cut to reduce hidden retention; `tasks/result` only on detail entry / explicit wait |
+| Separate relay-probe protocol surface | Folded into the first relayed `ui/initialize` |
+| Approval over HTML hash alone | Approval binds to `manifestHash` (HTML + sandbox + permissions + network policy + URI + trust-policy version) |
 | Multiplexed / pooled sandbox proxy iframe | One proxy iframe per app instance in v1 |
-| User-agent allow/deny list for browser support | Runtime relay self-test instead |
+| User-agent allow/deny list for browser support | Runtime relay self-test (folded into `ui/initialize`) instead |
 | Locally cached `tasks/result` past upstream TTL | Cache, not durable store; persistence beyond TTL is post-v1 |
 | Durable persistence of view-internal app state | Spec defers; remount artifact only re-instantiates the view |
+| Coexistence of legacy `UIResourceRenderer` with new Apps path on same message | Legacy path disabled when `MCP_APPS_ENABLED=true` |
 | `allow-popups` / `allow-top-navigation` / `allow-forms` sandbox flags | `ui/open-link` is the single navigation/escape path |
 | `fullscreen` / `pip` display modes | Inline only in v1 |
 | `tool-input-partial` streaming | Requires `@librechat/agents` changes |
@@ -467,15 +702,19 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   watching its task). When no observer exists, polling stops; the
   task continues server-side. On user return, the jobs panel uses
   `tasks/list` + `tasks/get` to refresh state and surfaces TTL.
-- **Jobs panel is status-only by default.** Opening the panel
-  does **not** call `tasks/result` for terminal rows. It loads
-  task state with `tasks/list` / `tasks/get`, displays status and
-  TTL, and only calls `tasks/result` on (a) explicit detail
-  entry, (b) a "wait for result" action on an in-flight task, or
-  (c) opportunistic save when a subscribed task transitions to
-  terminal while the user is present. This keeps panel-open
-  cheap on accounts with many completed tasks and respects
-  TTL-bound result retention.
+- **Jobs panel is status-only.** Opening the panel does **not**
+  call `tasks/result` for any row. It loads task state with
+  `tasks/list` / `tasks/get`, displays status and TTL, and
+  only calls `tasks/result` on (a) explicit detail entry or
+  (b) explicit "wait for result" on an in-flight task. There
+  is **no opportunistic save** path: a subscribed task that
+  reaches terminal while the user is present does **not**
+  trigger an automatic `tasks/result`. The mounted view that
+  produced the task already received the underlying tool
+  result via the bridge; the host does not need to re-fetch
+  it. Cutting opportunistic save eliminates a hidden
+  retention layer and matches the spec's normative status
+  path more cleanly.
 - **Single-path "wait for result."** When the user explicitly
   enters a blocking wait state (detail-row "wait for result"),
   the host **suspends `tasks/get` polling for that task** and
@@ -569,7 +808,9 @@ Reference:
 | Tools, resources, prompts | Done (sampling/roots not impl.) | `packages/api/src/mcp/connection.ts` |
 | OAuth 2.0 + dynamic client registration + PKCE | Done | `packages/api/src/mcp/oauth/` |
 | MCP server management UI | Done | `client/src/components/SidePanel/MCPBuilder/` |
-| Sandboxed iframe UI rendering (mcp-ui ad-hoc) | Done | `client/src/components/MCPUIResource/` via `@mcp-ui/client` |
+| Sandboxed iframe UI rendering (mcp-ui ad-hoc, `allow-popups` default) | Done — to be retired/gated | `client/src/components/MCPUIResource/MCPUIResource.tsx` via `@mcp-ui/client` |
+| Cross-surface audit of `UIResourceRenderer` mounts (chat, share, search, plugin) | Phase 1 | client surfaces |
+| Default deny `sandboxPermissions` on legacy path when `MCP_APPS_ENABLED=false` | Phase 1 | legacy renderer |
 | Sampling / elicitation | Missing | blocks `input_required` |
 | 307/308 redirect handling on Streamable HTTP | Done on `main` | transport layer |
 | Cross-origin credential stripping on redirects | Done on `main` | transport layer |
@@ -585,9 +826,13 @@ Reference:
 | `ui/initialize` handshake + truthful `hostContext` (full surface) | Missing | — |
 | Single-ACL forwarded-method enforcement (incl. cross-server isolation) | Missing | — |
 | Self-contained-HTML validator (rejects all external assets, `<base>`) | Missing | — |
-| First-launch resource review + `sha256(html)` hash pinning | Missing | — |
-| `MCPAppInstance` artifact for remount (separate from model context) | Missing | — |
-| Per-resource CSP via `<meta>` injection (strict; only `connectDomains` honored) | Missing | — |
+| Content decoding pipeline (MIME, `text`/`blob`, UTF-8, multi-content reject) | Missing | — |
+| `MCPAppLaunchManifest` builder + canonical-JSON hasher (RFC 8785) | Missing | — |
+| First-launch resource review + manifest pinning (`MCPResourceReview.manifestHash`) | Missing | — |
+| `MCPAppInstance` artifact for remount (narrow, `manifestHash`-bound) | Missing | — |
+| Per-resource CSP via `<meta>` injection (strict; `connect-src 'none'`) | Missing | — |
+| Operational limits (HTML size, view-bound payload, teardown wait, rate limits, init timeout) | Missing | — |
+| `authContextHash` canonicalizer + unit-test corpus | Missing | `packages/api` |
 | Sizing fallback height + `shrinkWrap: false` opt-out | Missing | — |
 | Trust UX (sandbox boundary chrome) | Missing | — |
 | MCP Tasks (per-tool negotiation, active-subscriber polling, single-path wait, `authContextHash` binding, TTL-bounded cache, semantic-equivalence rehydration) | Missing | — |
@@ -631,15 +876,23 @@ feature flag is on.
 
 ### Wire-format-compliant flow
 
-- **Outer (per-instance):** the host renders **one** iframe per
-  rendered Apps view, served from `MCP_SANDBOX_ORIGIN` (different
-  origin from the LibreChat application). No proxy pooling, no
-  multiplexing of multiple app instances through a shared
-  proxy. Each iframe loads a static `proxy.html` shipped by
-  LibreChat. The sandbox-origin response includes
+- **Outer proxy iframe (per-instance), at `MCP_SANDBOX_ORIGIN`:**
+  the host renders **one** iframe per Apps view, served from
+  `MCP_SANDBOX_ORIGIN` (different origin from LibreChat). No
+  pooling, no multiplexing. The iframe loads a static
+  `proxy.html` shipped by LibreChat. The sandbox-origin
+  response includes
   `Content-Security-Policy: frame-ancestors <librechat-origin>;`
-  and disables caching. **No application authentication runs at
-  the sandbox origin.**
+  and disables caching. The outer proxy iframe attribute is
+  `sandbox="allow-scripts allow-same-origin"` per the Apps
+  spec's host-side proxy requirements. **No application
+  authentication runs at the sandbox origin.**
+- **Inner app iframe, opaque origin:** rendered inside the
+  proxy via `srcdoc=html`. Sandbox flags use the v6/v7
+  hardened set and **never** include `allow-same-origin`.
+  This is what produces the `null` origin for the inner
+  view; it is intentional and is the reason direct browser
+  networking is cut in v1 (see CSP).
 - **Bridge wrapper.** The host wraps `AppBridge` from
   `@modelcontextprotocol/ext-apps`. The transport layer is a thin
   shim around `PostMessageTransport`'s receive logic that sends with
@@ -652,26 +905,32 @@ feature flag is on.
   Apps when no app is in use.
 - **Wire flow:**
   1. Proxy emits `ui/notifications/sandbox-proxy-ready`.
-  2. Host fetches the resource server-side via `resources/read`,
-     runs the resource through the review pipeline (self-
-     contained-HTML validation, hash check, `<meta>` CSP
-     synthesis), and sends
+  2. Host runs the content-decoding pipeline (MIME +
+     `text`/`blob` decode + UTF-8 validate + multi-content
+     reject + self-contained-HTML validator + manifest
+     construction + `manifestHash`), checks the manifest
+     against `MCPResourceReview`, and sends
      `ui/notifications/sandbox-resource-ready` with
      `{ html, sandbox, csp, permissions, nonce }`. The
-     128-bit `nonce` is per-view and host-generated. It is
-     **proxy-stamped** onto every relayed inbound message;
-     the inner view never sees it and never echoes it.
-  3. Proxy creates an inner iframe with `srcdoc=html`, host-filtered
-     `sandbox` flags, and `allow=<filtered permissions>`.
-  4. **Relay self-test.** Before completing initialization, the
-     host pings the proxy through the relay (host → proxy →
-     bound inner window → proxy → host) with the per-view
-     nonce. If the nonce does not round-trip correctly, the
-     host tears down the iframe and falls back to the legacy
-     text-only path for that mount with a clear chrome
-     message. This replaces user-agent sniffing.
-  5. The view runs the standard initialization handshake before the
-     host sends `tool-input`, `tool-result`, etc.
+     128-bit `nonce` is per-view and host-generated; the
+     proxy stamps it onto every relayed inbound message. The
+     inner view never sees it and never echoes it.
+  3. Proxy creates the inner iframe with `srcdoc=html`,
+     host-filtered `sandbox` flags (no `allow-same-origin`),
+     and `allow=<filtered permissions>`. It also starts the
+     `MCP_APPS_INITIALIZE_TIMEOUT_MS` clock.
+  4. **Relay probe folded into `ui/initialize`.** The view
+     sends `ui/initialize` through its postMessage transport;
+     the proxy stamps the per-view nonce and forwards to the
+     host. If the host receives a schema-valid initialize
+     with the correct nonce within the timeout, the mount
+     passes and the host responds. Otherwise the host tears
+     down the iframe and falls back to text-only for that
+     mount with a clear chrome message. There is **no**
+     separate ping protocol surface — the spec's normative
+     init **is** the test.
+  5. The view sends `ui/notifications/initialized`; only then
+     may the host emit `tool-input`, `tool-result`, etc.
 
 ### Host construction order (invariant)
 
@@ -751,23 +1010,24 @@ different jobs and accept different things.
 
 ### Browser support stance
 
-- Browser support is decided by a **runtime relay self-test**,
-  not by a user-agent allow/deny list. The probe runs on every
-  view mount during initialization and verifies the per-view
-  nonce round-trips through the host → proxy → inner window
-  → proxy → host loop.
+- Browser support is decided by a **runtime relay self-test
+  folded into `ui/initialize`**, not by a user-agent allow/
+  deny list. The first relayed initialize is the test:
+  schema-valid + correct proxy-stamped nonce + within
+  `MCP_APPS_INITIALIZE_TIMEOUT_MS` ⇒ mount passes.
 - Chromium and Firefox are expected to pass.
 - WebKit/Safari currently has an upstream issue around
-  sandbox relay `event.source` reporting; the probe will
-  detect it. If WebKit fails the probe, the host falls back
-  to the legacy text-only path for that mount and surfaces a
-  chrome message ("This browser cannot render this app
-  safely; showing a text summary instead."). When upstream
-  resolves the issue, support resumes automatically without
-  a code change.
+  sandbox relay `event.source` reporting; the folded-in
+  probe detects it because the relay-stamped initialize
+  fails to validate. The host falls back to the legacy
+  text-only path for that mount and surfaces a chrome
+  message ("This browser cannot render this app safely;
+  showing a text summary instead."). When upstream resolves
+  the issue, support resumes automatically without a code
+  change.
 - The fallback path is per-mount, not per-session, so a user
   on a half-broken engine can still see other Apps if their
-  relay probes pass.
+  initializations pass.
 
 ### Iframe sandbox flags (hardened defaults)
 
@@ -825,29 +1085,33 @@ It enforces:
   Policy">` injected before the closing `</head>` of the `html`
   payload.
 - v1 policy is **strict by construction** because the resource is
-  required to be self-contained (see Asset policy below):
+  required to be self-contained (see Asset policy below) **and**
+  no direct browser networking is allowed:
   ```
   default-src 'none';
   script-src  'unsafe-inline';
   style-src   'unsafe-inline';
   img-src     data:;
-  connect-src <derived from _meta.ui.csp.connectDomains>;
+  connect-src 'none';
   base-uri    'none';
   form-action 'none';
   ```
   `'unsafe-inline'` is necessary because the resource ships its
   scripts and styles inline; with no remote script origins
   permitted, the XSS surface is bounded to whatever is in the
-  approved bytes (which is exactly what hash pinning protects).
-- `connect-src` is the only directive that draws from server
-  metadata. `_meta.ui.csp.connectDomains` is honored verbatim,
-  intersected with a host deny list. **`resourceDomains`,
-  `frameDomains`, and `baseUriDomains` are ignored in v1**
-  because v1 forbids the corresponding HTML constructs (remote
-  assets, frames, `<base>`).
-- The injector refuses HTML whose declared `connectDomains`
-  would still block its own initialization (e.g. a self-call
-  required by the bridge).
+  approved bytes (which is exactly what `manifestHash` protects).
+- **No directive draws from server metadata in v1.**
+  `_meta.ui.csp.connectDomains`, `resourceDomains`,
+  `frameDomains`, and `baseUriDomains` are all **ignored**.
+  v1 forbids the HTML constructs the latter three would
+  permit, and v1 cuts direct browser networking, which is
+  what the former would permit. The fields are still parsed
+  (so v2 can re-introduce them) but never installed.
+- All app network access flows through the bridge:
+  `tools/call`, `resources/read`, and `ui/open-link`. Apps
+  that need to call out to a third-party API expose that as
+  an MCP tool on their own server; the host calls it on
+  behalf of the view.
 - Documented `<meta>`-CSP limitations: `sandbox`, `frame-ancestors`,
   `report-uri` cannot be expressed. `sandbox` uses the iframe
   attribute; `frame-ancestors` is enforced by the proxy.html
@@ -874,10 +1138,16 @@ each candidate `ui://` resource and **rejects** any of:
 What the resource **may** include:
 
 - Inline `<script>` and `<style>` blocks (subject to byte
-  hashing).
+  hashing inside the manifest).
 - `data:` images.
-- `connect-src` calls to origins in
-  `_meta.ui.csp.connectDomains` (XHR/fetch/WebSocket only).
+
+What the resource **may not** do over the network:
+
+- Direct `fetch`, XHR, or WebSocket from view JS. The CSP
+  default is `connect-src 'none'`. App authors call MCP
+  `tools/call` or `resources/read` through the bridge for
+  any server interaction, or use `ui/open-link` for
+  user-driven navigation/downloads.
 
 Why this is tighter than v6: under v6's "absolute HTTPS in
 `resourceDomains` is fine" rule, the host-side approval was over
@@ -936,6 +1206,87 @@ external to resolve.
 - `host-context-changed` fires when the user resizes the host
   shell so the view sees fresh `containerDimensions`.
 
+## Content decoding and MIME validation
+
+UI resources arrive via `resources/read` as either `text` or
+base64 `blob`, with MIME type
+`text/html;profile=mcp-app`. The review pipeline runs in this
+order; any step's failure aborts review with a clear,
+operator-loggable error.
+
+1. **MIME validation.** Reject if `mimeType` is missing or, after
+   parameter-order normalization, is not
+   `text/html;profile=mcp-app`. Other text MIME types (e.g.
+   `text/markdown`, `text/plain`) fall back to legacy text
+   rendering, not Apps.
+2. **Decode.** `text` is taken verbatim. `blob` is base64-decoded
+   inside the `MCP_APPS_MAX_HTML_BYTES` cap (default 2 MiB);
+   over-cap payloads fail review without further work.
+3. **UTF-8 validate** the decoded bytes; reject on invalid
+   sequences.
+4. **Multi-content rejection.** A `resources/read` response with
+   more than one content item is rejected; v1 expects exactly one
+   HTML payload per resource.
+5. **Self-contained-HTML validator** (see Asset policy).
+6. **Manifest construction.** Build the canonical
+   `MCPAppLaunchManifest` from decoded HTML, host-filtered
+   sandbox flags, effective `allow` permissions, effective
+   network policy (always `connect-src 'none'` in v1, plus the
+   navigation allowlist intersection), `resourceUri`, and host
+   trust-policy version.
+7. **`manifestHash`** is `sha256(canonicalJSON(manifest))` (RFC
+   8785 JCS-equivalent). This is the hash recorded in
+   `MCPResourceReview.manifestHash` and
+   `MCPAppInstance.manifestHash`.
+
+Resources that pass all seven steps are eligible for approval
+under operator policy; resources that fail are surfaced in the
+`MCPBuilder/` admin UI with the failing step.
+
+## Operational limits
+
+These defaults bound the security surface and runtime cost of
+Apps and Tasks. All are operator-tunable; defaults lean toward
+safety.
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `MCP_APPS_MAX_HTML_BYTES` | 2 MiB | Maximum decoded HTML accepted at review |
+| `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` | 8 MiB | Maximum view-bound `tool-result` payload (truncated with marker over the limit) |
+| `MCP_APPS_TEARDOWN_WAIT_MS` | 1500 | Time to wait for `ui/resource-teardown` response before forcing iframe removal |
+| `MCP_APPS_INITIALIZE_TIMEOUT_MS` | 5000 | Deadline for the first relayed `ui/initialize` to complete the (folded-in) probe |
+| `MCP_APPS_VIEW_RPC_RATE_PER_MIN` | 600 | Inbound JSON-RPC requests per view per minute before throttling/pause |
+| `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN` | 1200 | Inbound notifications per view per minute before throttling/pause |
+| `MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES` | 12 MiB | Inline-stored `tasks/result` envelope size before blob-offload |
+| `MCP_TASKS_PER_USER_QUOTA` | 100 | Maximum live (non-expired) tasks per `authContextHash` |
+| `MCP_APPS_FALLBACK_HEIGHT_PX` | 320 | Fallback iframe height until first non-zero `size-changed` |
+| `MCP_APPS_HASH_PINNING_REQUIRED` | `false` | When `true`, manifest divergence is a hard refuse |
+
+Limits are enforced in code; tests assert each limit triggers
+the documented behavior at the boundary.
+
+## `authContextHash` canonicalization
+
+```
+authPayload = {
+  userId: string | null,
+  mcpServerId: string | null,
+  credentialSource: "user_oauth" | "user_apikey" | "shared_apikey" |
+                    "system_oauth" | "anonymous" | null,
+  headerAuthFingerprint: string | null,  // sha256 of normalized
+                                         // header-auth value, or null
+  configRevision: string | null,         // server config monotonic rev
+}
+authContextHash = sha256(canonicalJSON(authPayload))
+```
+
+`canonicalJSON` follows RFC 8785 JCS: lexicographically sorted
+keys, no insignificant whitespace, no trailing commas, UTF-8
+output. Missing fields are explicit `null`, never omitted, so
+"absent" and "empty" are distinguishable. The function lives in
+`packages/api` with a dedicated unit-test corpus covering field
+permutations, null vs missing, and round-trip equality.
+
 ## Data boundary rules
 
 A `CallToolResult` (or rehydrated `tasks/result` envelope) flows
@@ -985,62 +1336,101 @@ appear in view-bound serialization when the server provided them.
 
 ## Resource review (server-side)
 
-- All `_meta.ui.resourceUri` discovery, fetching, self-contained-
-  HTML validation, hashing, CSP synthesis, and caching happens in
+- All `_meta.ui.resourceUri` discovery, fetching, content
+  decoding, self-contained-HTML validation, manifest
+  construction, hashing, CSP synthesis, and caching happens in
   the host backend. The browser receives an **already-approved**
-  payload — and under v7's self-contained-HTML rule, this is
-  literally true: there are no external bytes that can change
-  under the host's feet.
+  payload.
 - **First-launch review.** The first time a tool with
-  `_meta.ui.resourceUri` is invoked, the host fetches via
-  `resources/read`, runs the self-contained-HTML validator (see
-  Asset policy), computes `sha256(html)`, and stores
-  `(serverName, resourceUri, sha256, firstSeen)` in
-  `MCPResourceReview`. Operator policy decides auto-allow vs
-  manual-review. Until approved, the tool falls back to text-only.
-- **Hash pinning is required when configured, advisory by
+  `_meta.ui.resourceUri` is invoked, the host runs the full
+  decoding pipeline (see "Content decoding and MIME validation"),
+  builds the launch manifest, computes `manifestHash`, and
+  stores `(serverName, resourceUri, manifestHash, manifest,
+  firstSeen, authContextHashSeen)` in `MCPResourceReview`.
+  Operator policy decides auto-allow vs manual-review. Until
+  approved, the tool falls back to text-only.
+- **Manifest pinning is required when configured, advisory by
   default.** Operators may set
-  `MCP_APPS_HASH_PINNING_REQUIRED=true`, in which case any hash
-  divergence on subsequent launches is a hard refuse. With
-  external assets gone, divergence means an actual code change
-  in the resource itself, so this is no longer noisy. Default
-  for v1 is advisory (warn + auto-approve under operator policy)
-  to ease initial onboarding.
+  `MCP_APPS_HASH_PINNING_REQUIRED=true`, in which case any
+  manifest divergence on subsequent launches is a hard refuse.
+  Because the manifest covers HTML + sandbox flags + permissions
+  + network policy + URI + trust-policy version, divergence
+  catches policy drift, not just byte drift.
 - **No proactive crawl** of `_meta.ui.resourceUri` after every
   `tools/list`. That is product polish and out of v1.
 
 ## Persisted app-instance artifact (remount)
 
-- `MCPAppInstance` is a new collection holding
+`MCPAppInstance` exists for one job: re-rendering the same
+approved view when a conversation is reopened. It is **not** a
+state-management store, **not** model-visible, and **not** a
+generic launch log.
+
+- Fields:
   `(_id, conversationId, messageId, mcpServerId, toolName,
-  resourceUri, approvedHash, createdAt, lastSeen,
-  authContextHash)`.
-- One `MCPAppInstance` is created per launched app view.
-- On chat reload or navigation back to a conversation
-  containing app messages, the host queries
+  resourceUri, manifestHash, authContextHash, createdAt,
+  lastSeen)`.
+- One row per launched app view.
+- On chat reload or navigation back, the host queries
   `MCPAppInstance` for the conversation and replays the
-  view-launch lifecycle (fetch resource → review → approve →
-  render proxy iframe → run handshake) for each instance.
-- View-internal state (selection, scroll position, in-flight
-  internal SPA navigation) is **not** preserved — the spec
-  defers this in v1. The artifact only guarantees the view
-  re-instantiates against the same approved bytes so the user
-  sees the app instead of an empty placeholder.
-- The artifact is **not** model-visible. It is a host-side
-  rendering descriptor, separate from message content.
-- If `approvedHash` no longer matches when the host re-fetches
-  the resource (e.g. server upgraded the app), the host
-  surfaces a "this app has been updated since you opened the
-  conversation" notice and offers to re-approve via the normal
-  review path.
+  view-launch lifecycle (fetch resource → decode → validate →
+  manifest → manifest-pin check → render proxy → fold-in
+  initialize) for each instance. View-internal state
+  (selection, scroll, in-flight SPA navigation) is **not**
+  preserved.
+- Apps that need durable view state keep it on their MCP
+  server (e.g. via a server-defined session ID surfaced to
+  the view through `tools/call`); LibreChat does not own a
+  second state-management surface.
+- If `manifestHash` no longer matches on rehydrate (server
+  upgraded the app or changed its policy), the host surfaces
+  a "this app has been updated since you opened the
+  conversation" notice and offers re-approval via the
+  normal review path.
+
+## Legacy `UIResourceRenderer` migration
+
+LibreChat currently ships
+`client/src/components/MCPUIResource/MCPUIResource.tsx`, which
+mounts `UIResourceRenderer` from `@mcp-ui/client` with
+`sandboxPermissions: 'allow-popups'`. This component is
+reachable from chat, share, and search views (and any plugin
+path that renders MCP UI resources). Leaving it active
+alongside the strict Apps path would mean two competing
+security models in production.
+
+- **When `MCP_APPS_ENABLED=true`:** the legacy renderer is
+  **disabled across every surface that can mount it** —
+  `client/src/components/Chat/...`, share-page renderers,
+  search-result renderers, plugin-rendered messages. Tools
+  declaring `_meta.ui.resourceUri` route through the new
+  Apps path; other UI resources fall back to text. There is
+  no message in any view where the legacy renderer fires.
+- **When `MCP_APPS_ENABLED=false`:** the legacy renderer
+  stays as today, but its default `sandboxPermissions` is
+  changed from `'allow-popups'` to `''` (deny by default),
+  and a chrome banner explains the migration path. This is
+  the operator-opt-in fallback, not a parallel rendering
+  model.
+- Phase 1 includes a cross-surface audit listing every entry
+  point that can render `UIResourceRenderer`, with tests
+  asserting each one switches to the Apps path (or text
+  fallback) when the flag is on.
+- There is no shared rendering code between the legacy path
+  and the Apps path. The Apps path lives under
+  `client/src/components/Chat/MCPApp/`.
 
 ## Trust UX
 
-- Persistent border + header on every view labeled "App from
-  `<server name>`" with click-through to server identity, OAuth
-  scopes, and resource hash.
-- Label uses LibreChat-controlled fonts/colors rendered **outside**
-  the view iframe so app CSS cannot override.
+- Persistent border + header on every Apps view labeled
+  "App from `<server name>`" with click-through to server
+  identity, OAuth scopes, and `manifestHash` short-prefix.
+- `_meta.ui.prefersBorder` is **ignored in v1**: trust chrome
+  is mandatory regardless of resource preference. Re-evaluate
+  when there is a stronger provenance and permissions
+  surface.
+- Label uses LibreChat-controlled fonts/colors rendered
+  **outside** the view iframe so app CSS cannot override.
 - Permission prompts (`ui/message` consent, `ui/open-link`
   confirmation) appear in host chrome.
 - Host-rendered "exit app" affordance always available.
@@ -1121,26 +1511,45 @@ capability advertised**.
   app cannot read or forge it; messages from the inner frame to
   the host directly (bypassing the proxy) are rejected. Run on
   Chromium, Firefox, and WebKit/Safari.
-- **Runtime relay self-test**: per-mount probe that simulates
-  the round-trip; on failure, the host tears down the iframe
-  and falls back to legacy text-only rendering for that mount.
+- **Folded-in relay probe**: the host instruments the first
+  relayed `ui/initialize` with the `MCP_APPS_INITIALIZE_TIMEOUT_MS`
+  deadline; on timeout or schema/nonce failure, the host tears
+  down the iframe and falls back to legacy text-only rendering
+  for that mount. There is no separate ping protocol surface.
+- **Content decoding pipeline**: MIME validation
+  (`text/html;profile=mcp-app`), `text`/`blob` decode under
+  `MCP_APPS_MAX_HTML_BYTES`, UTF-8 validation, multi-content
+  rejection.
+- **`MCPAppLaunchManifest` builder + canonical-JSON hasher**
+  (RFC 8785 JCS). Tests cover deterministic hash output across
+  field orderings and against a fixture corpus.
 - `MCPResourceReview` collection + **self-contained-HTML
   validator** (rejects `<script src>`, `<link href>`,
   `<img src>` to remote, `<base>`, etc.).
 - `MCPAppInstance` collection scaffold for remount.
+- **Outer-proxy-iframe** sandbox flags pinned to
+  `allow-scripts allow-same-origin`; **inner-iframe** sandbox
+  flag set excludes `allow-same-origin`. Cross-engine test
+  asserts both attributes are correct on render.
+- **Operational-limits scaffold**: settings parsed and applied
+  even though most surfaces are fixture-only at this phase.
+- **`authContextHash` canonicalizer** lands with its
+  unit-test corpus; consumed by Phase 0 connection setup.
 - Tests with `mongodb-memory-server` + real
   `@modelcontextprotocol/sdk` + Playwright cross-origin iframes.
 
 Phase 1 exit criteria:
 
 1. Construction-order test passes on every supported engine.
-2. Hop-separated relay test passes; runtime probe reliably
-   detects engines where the relay is unsafe and triggers
-   text-only fallback.
+2. Hop-separated relay test passes; folded-in initialize probe
+   reliably detects engines where the relay is unsafe and
+   triggers text-only fallback.
 3. Default chat bundle size does not regress by more than a
    small known delta from `main` when Apps is not in use.
 4. Self-contained-HTML validator rejects every external-asset
    construct in the test corpus.
+5. Manifest hasher is deterministic across reorderings and
+   matches fixture vectors byte-for-byte.
 
 ### Phase 2 — Apps v1 end-to-end + capability turn-on (≈2–3 weeks)
 
@@ -1172,20 +1581,35 @@ render inline with full HostContext.
   populated from the in-flight tool call.
 - `host-context-changed` notifications on theme/locale/dimension
   changes.
-- First-launch resource review (self-contained-HTML validation);
-  `sha256(html)` hash recorded; `MCPBuilder/` UI for approvals.
-- **Hash pinning** wired through `MCPResourceReview` and
-  `MCPAppInstance.approvedHash`; default advisory in v1, hard
+- First-launch resource review (full content-decoding pipeline);
+  `manifestHash` recorded; `MCPBuilder/` UI for approvals.
+- **Manifest pinning** wired through `MCPResourceReview` and
+  `MCPAppInstance.manifestHash`; default advisory in v1, hard
   refuse when `MCP_APPS_HASH_PINNING_REQUIRED=true`.
+  Divergence covers HTML, sandbox flags, permissions, network
+  policy, URI, and trust-policy version — not just bytes.
 - **`MCPAppInstance` write path**: every successful app launch
-  records an instance record so re-opening the conversation
-  re-renders the app without inflating model context. Hash
-  divergence on rehydrate surfaces a "this app has been updated"
-  notice with a re-approval action.
+  records an instance row so re-opening the conversation
+  re-renders the app without inflating model context. Manifest
+  divergence on rehydrate surfaces a "this app has been
+  updated" notice with a re-approval action. The artifact is
+  intentionally narrow: no view-internal state.
+- **Legacy `UIResourceRenderer` migration**:
+  - Cross-surface audit landed (chat, share, search,
+    plugin-rendered messages); each entry point has a test
+    asserting that, with `MCP_APPS_ENABLED=true`, it routes
+    to the Apps path or falls back to text — never to the
+    legacy renderer.
+  - With `MCP_APPS_ENABLED=false`, default
+    `sandboxPermissions` for the legacy path is changed
+    from `'allow-popups'` to `''`, with a chrome banner.
+  - No mode where both paths render the same message.
 - Trust UX chrome around every view (sandbox-rendered chrome
-  shows server identity, OAuth scopes, `approvedHash`, and an
-  exit-app affordance).
-- Reject resources declaring `_meta.ui.domain` with a clear error.
+  shows server identity, OAuth scopes, `manifestHash`
+  short-prefix, and an exit-app affordance). Trust chrome is
+  mandatory; `_meta.ui.prefersBorder=false` is ignored.
+- Reject resources declaring `_meta.ui.domain` with a clear
+  error.
 - **Two helpers, not one** for the data boundary
   (`toModelView`, `toViewSurface`). Plumb both through agent
   tool-result handling, persistence, and view delivery. Tests
@@ -1193,12 +1617,25 @@ render inline with full HostContext.
   path, **and** (b) `_meta` (including
   `io.modelcontextprotocol/related-task` and server-defined
   keys) is preserved on the view path.
+- **View-bound payload truncation** at
+  `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` with a clear marker
+  so the view sees a deterministic truncation rather than a
+  broken payload.
 - Sizing fallback: apply `MCP_APPS_FALLBACK_HEIGHT_PX` until the
   first non-zero `size-changed`; honor the `shrinkWrap: false`
   per-server opt-out.
+- **`ui/resource-teardown`** wait timeout
+  (`MCP_APPS_TEARDOWN_WAIT_MS`); on timeout, force-remove the
+  iframe and log.
+- **Per-view rate limits** enforced
+  (`MCP_APPS_VIEW_RPC_RATE_PER_MIN`,
+  `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN`); over-limit views are
+  paused with a clear chrome message.
 - **Apps feature flag** (`MCP_APPS_ENABLED`) added; OFF by
   default until interop matrix passes. Toggle is independent of
-  Tasks.
+  Tasks. Turning the flag on **disables** the legacy renderer
+  across all surfaces in the same release; there is no
+  in-between state.
 - **End of phase**: enable Apps capability advertisement when
   `MCP_APPS_ENABLED=true` and interop matrix passes. Tasks may
   still be OFF at this point.
@@ -1223,11 +1660,13 @@ for implemented directions.
     open jobs panel, active conversation) owns its own poll
     against `tasks/get` while present. When no subscriber is
     observing, polling stops; the task continues server-side.
-    `tasks/result` is invoked only on explicit detail entry, a
-    "wait for result" action, or opportunistic save when a
-    subscribed task reaches terminal with the user present. No
-    background API-process poller. Opening the jobs panel never
-    eagerly fetches `tasks/result` for terminal rows.
+    `tasks/result` is invoked **only** on explicit detail
+    entry or explicit "wait for result". There is **no
+    opportunistic save** in v1: a subscribed task that reaches
+    terminal while the user is present does **not** trigger
+    an automatic `tasks/result` fetch. No background
+    API-process poller. Opening the jobs panel never eagerly
+    fetches `tasks/result` for terminal rows.
   - **Single-path "wait for result."** When the user enters a
     blocking wait, the host suspends `tasks/get` for that task
     and relies on a single `tasks/result` call. Polling
@@ -1341,27 +1780,40 @@ the user navigates.
    The CAD app ships its viewer (Three.js + WASM B-Rep kernel)
    as inline JS bundled into the HTML — no `<script src>` to a
    CDN, no `<link href>` to a font host. The host fetches the
-   HTML server-side via `resources/read`, runs the
-   self-contained-HTML validator, computes `sha256(html)`,
-   validates against the operator-approved pin, injects the
-   strict `<meta>` CSP (`connect-src` from
-   `_meta.ui.csp.connectDomains`), and sends
+   resource server-side via `resources/read`; the content
+   pipeline validates MIME (`text/html;profile=mcp-app`),
+   decodes (`text` or `blob`), UTF-8 validates, runs the
+   self-contained-HTML validator, builds the
+   `MCPAppLaunchManifest`, and computes `manifestHash`. With
+   the operator-approved pin matching, the host injects the
+   strict `<meta>` CSP (`connect-src 'none'` — no direct
+   browser networking in v1) and sends
    `sandbox-resource-ready`. The host instantiates a fresh
-   per-instance proxy iframe, runs the construction-order
-   sequence and the runtime relay self-test; on success the
-   inner iframe renders via `srcdoc`. On any probe failure
-   the host falls back to a text-only summary and explains why.
+   per-instance proxy iframe (outer
+   `sandbox="allow-scripts allow-same-origin"`, inner sandbox
+   without `allow-same-origin`), runs the construction-order
+   sequence, and waits for the relayed `ui/initialize`. On
+   success the inner iframe is alive and the bridge is
+   open; on timeout, schema failure, or nonce failure the
+   host falls back to a text-only summary and explains why.
    An `MCPAppInstance` row is written so re-opening this
    conversation later re-renders the app without storing
    anything in model context.
-2. The view starts in an "upload" panel. It calls
-   `cad.create_upload_url` (`taskSupport: forbidden`) over the
-   bridge for a presigned PUT URL. The view PUTs the file
-   directly to blob storage (CSP `connect-src` from
-   `_meta.ui.csp.connectDomains` whitelists the storage origin).
-   It then calls `cad.ingest({ key })` (`taskSupport: required`),
-   which runs as a task. The mounted view subscribes to its own
-   poll loop on `tasks/get`.
+2. The view starts in an "upload" panel. It cannot `fetch` or
+   PUT directly to blob storage (CSP `connect-src 'none'`).
+   Instead it calls `cad.create_upload_session(file_name,
+   size, hash)` (`taskSupport: forbidden`) through the bridge.
+   The CAD MCP server hands back a session ID. To upload, the
+   view either streams chunks back through `cad.upload_chunk`
+   (host proxies, no direct browser fetch) or — the more
+   common pattern in v1 — invokes `ui/open-link` against a
+   short-TTL presigned URL on the navigation allowlist so the
+   user's browser performs the upload natively, then polls
+   `cad.get_session_status` until it sees the session
+   ingested. It then calls `cad.ingest({ session_id })`
+   (`taskSupport: required`), which runs as a task. The
+   mounted view subscribes to its own poll loop on
+   `tasks/get`.
 3. When `cad.ingest` completes, its `tools/call` returns a
    `CallToolResult` whose `structuredContent` carries the
    tessellated GLTF + B-Rep face IDs and whose `content` carries
@@ -1415,6 +1867,32 @@ the user navigates.
   the host truthfully claim it has approved the bytes the user
   runs. Operator docs make this rule prominent so app authors
   hit it at design time, not deploy time.
+- **No direct browser networking is the bigger constraint.**
+  v1 cuts in-app `fetch` / XHR / WebSocket entirely. Apps
+  whose bundle today calls a third-party API have to expose
+  that as an MCP tool on their server (the host calls it on
+  the view's behalf) or use `ui/open-link` for user-driven
+  navigation. The reason is that without `allow-same-origin`
+  on the inner frame and without `_meta.ui.domain`, the
+  inner-frame origin is `null`, which fails for conservative
+  CORS, cookies, OAuth, and origin-based API allowlists.
+  Re-introducing `connect-src` is post-v1 and depends on a
+  stable-origin design.
+- **Approval is over a manifest, not just bytes.** Hash
+  divergence catches policy drift (sandbox, permissions,
+  network policy, URI, trust-policy version), not just byte
+  drift. App authors must understand that altering CSP
+  metadata or sandbox flags forces re-approval even if the
+  HTML is unchanged.
+- **Legacy `UIResourceRenderer` retirement is binary.** When
+  `MCP_APPS_ENABLED=true`, the legacy renderer is gone from
+  every surface. Operators who depended on
+  `'allow-popups'`-style behavior must migrate or stay on the
+  flag-off path with the deny-default banner.
+- **Operational limits may surprise app authors.**
+  `MCP_APPS_MAX_HTML_BYTES = 2 MiB` rules out giant
+  pre-bundled apps; rate limits cap chatty views. Limits are
+  operator-tunable, but the defaults bias toward safety.
 - **WebKit/Safari relay risk handled by runtime probe.** No
   user-agent allow/deny list. The probe runs on every mount;
   when WebKit fails it, the user sees a clear text-only
@@ -1532,10 +2010,18 @@ the cross-origin iframe layer.
   rejected with a clear error; consent prompt in host chrome.
 - **`displayMode` / `availableDisplayModes` in `HostContext`**.
 - **`toolInfo`** populated in `HostContext`.
-- CSP enforcement: undeclared `connect-src` blocked; declared
-  origin succeeds. `<meta>`-CSP limitations exercised.
-- `ui/open-link` gated by navigation allowlist, not
-  `connectDomains`.
+- **CSP `connect-src 'none'` enforcement**: any in-app
+  `fetch` / XHR / WebSocket attempt is blocked by the
+  browser. The view must route network access via
+  `tools/call`, `resources/read`, or `ui/open-link`. Test
+  asserts that even a server explicitly setting
+  `connectDomains` does **not** install any `connect-src`
+  origin in the rendered CSP (the field is parsed but
+  ignored in v1).
+- `<meta>`-CSP limitations exercised (no `sandbox`, no
+  `frame-ancestors`, no `report-uri`).
+- `ui/open-link` gated by navigation allowlist, separate
+  from any CSP directive.
 - `size-changed` and `host-context-changed` round-trip.
 - Malformed JSON-RPC over `postMessage`: rejected, logged, no
   host crash.
@@ -1556,22 +2042,60 @@ the cross-origin iframe layer.
   reproduces a dropped `ui/initialize`; production code path
   attaches the listener first and the bridge initializes
   reliably. Asserted on Chromium, Firefox, and WebKit/Safari.
-- **Runtime relay self-test**: every mount runs the host →
-  proxy → inner → proxy → host probe; failure triggers
-  legacy text-only fallback for that mount and surfaces a
-  clear chrome message; success completes initialization.
+- **Folded-in initialize probe**: the first relayed
+  `ui/initialize` is the relay test. A fixture induces a
+  failure (timeout, missing nonce, malformed schema); the
+  host falls back to text-only for that mount with a clear
+  chrome message and writes a structured log line. There is
+  no separate ping path in the implementation.
+- **Outer-vs-inner sandbox split**: rendered DOM has the
+  outer proxy iframe with
+  `sandbox="allow-scripts allow-same-origin"` at
+  `MCP_SANDBOX_ORIGIN`, and the inner app iframe with the
+  hardened set excluding `allow-same-origin`. A test
+  asserts both attribute strings.
 - **Bundle-size regression**: default chat bundle does not
   include `AppBridge` / `PostMessageTransport` / Zod when no
   Apps view is mounted.
+- **Operational limits**:
+  - HTML over `MCP_APPS_MAX_HTML_BYTES` is rejected at
+    review.
+  - View-bound `tool-result` over
+    `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` is truncated
+    with a marker; model-path serialization is unaffected.
+  - `ui/resource-teardown` honored within
+    `MCP_APPS_TEARDOWN_WAIT_MS`; otherwise iframe is
+    force-removed.
+  - View exceeding `MCP_APPS_VIEW_RPC_RATE_PER_MIN` /
+    `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN` is paused with a
+    chrome message.
+- **Content decoding**: `text` and `blob` payloads both
+  succeed; oversize `blob` rejected; non-`text/html;profile
+  =mcp-app` MIME falls back to text; multi-content
+  responses rejected.
+- **Manifest hash determinism**: shuffling JSON key order
+  in any manifest field yields an identical
+  `manifestHash`; modifying any covered field changes it.
+- **Trust chrome mandatory**: a resource declaring
+  `prefersBorder: false` still renders inside host chrome.
+- **Legacy renderer gating**:
+  - With `MCP_APPS_ENABLED=true`, every entry point
+    (chat, share, search, plugin-rendered) routes
+    UI-resource messages to the Apps path or text — never
+    to `UIResourceRenderer`.
+  - With `MCP_APPS_ENABLED=false`, the legacy path's
+    default `sandboxPermissions` is `''`, not
+    `'allow-popups'`.
 - **Sizing fallback**: with no `size-changed` notification, the
   view renders at the operator-configured fallback height; once
   a non-zero `size-changed` arrives the host honors it; the
   `shrinkWrap: false` opt-out pins the view at the fallback
   height even if the SDK suggests shrinking.
-- First-launch resource review: `sha256(html)` stored;
-  divergent hash refused at next launch when
-  `MCP_APPS_HASH_PINNING_REQUIRED=true` (and surfaces a
-  notice + re-approval action when hash pinning is advisory).
+- First-launch resource review: `manifestHash` stored;
+  manifest divergence (HTML, sandbox, permissions, network
+  policy, URI, or trust-policy version) refused at next
+  launch when `MCP_APPS_HASH_PINNING_REQUIRED=true` and
+  surfaces a notice + re-approval action when advisory.
 - **Data boundary — model path**: `structuredContent` and
   `_meta` never appear in model-bound serialization, including
   across rehydration.
@@ -1611,9 +2135,11 @@ the cross-origin iframe layer.
   in-flight task **suspends `tasks/get` polling for that
   task**; only `tasks/result` is in flight. Polling resumes
   on call failure, user cancel, or navigation away.
-- **Opportunistic save**: a task subscribed by an active observer
-  that transitions to terminal while the user is present
-  triggers a single `tasks/result` and the result is cached.
+- **No opportunistic save**: a subscribed task that
+  transitions to terminal while the user is present does
+  **not** trigger any `tasks/result`; the test asserts no
+  such call is issued unless the user explicitly clicks
+  detail or "wait for result".
 - **TTL-bounded cache**: a cached `tasks/result` row is served
   only while `now < createdAt + ttl`; afterwards the cache
   refuses and a fresh `tasks/result` is issued (which may
