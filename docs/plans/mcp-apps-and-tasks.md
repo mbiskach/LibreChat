@@ -3,7 +3,7 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v12. See
+**Revision:** v13. See
 [`mcp-apps-and-tasks-changelog.md`](./mcp-apps-and-tasks-changelog.md)
 for the per-revision decision history. This file describes
 the current frozen state; implementers do not need to read
@@ -39,14 +39,18 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
   `MCP_APPS_MODE !== "disabled"`. **Both Preview and
   Hardened use the same outer-sandbox topology** (v11
   unified this).
-- **[H]** Self-contained HTML only; approves bytes, not
-  origins. (Preview honors upstream
-  `allowedConnectDomains` / `blockedDomains` model.)
-- **[H]** No direct browser networking; CSP `connect-src 'none'`.
-  (Preview honors upstream `connectDomains`.)
+- **[A]** **Single authoring profile across modes (v13).**
+  Self-contained HTML (inline scripts/styles, `data:`
+  images), **no** external assets (relative or absolute),
+  **no** direct browser networking (`connect-src 'none'` in
+  the inner CSP), bridge-routed only (`tools/call` /
+  `resources/read` / `ui/open-link`). This applies to both
+  Preview and Hardened. App authors build to one profile.
 - **[H]** Wasm and `eval`/`new Function`-using runtimes are
-  blocked at the CSP level. (Preview allows them via the
-  upstream CSP.)
+  blocked at the CSP level. (Preview allows them via a
+  relaxed inner CSP that adds `wasm-unsafe-eval` and
+  `'unsafe-eval'`; everything else in the CSP is identical
+  across modes.)
 - **[H]** Hardened is documented as the LibreChat Hardened
   App Profile, not as parity with stable Apps.
 - **[A]** PostMessage transport wrapper around `AppBridge`
@@ -93,11 +97,13 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
   visibility** — only artifacts in or near the viewport
   hydrate on conversation open; older artifacts hydrate on
   scroll or expand.
-- **[A]** `resources/read` may return a `contents[]` array;
-  the host picks the entry whose `uri` matches the declared
-  `resourceUri` and whose MIME parses as
-  `text/html;profile=mcp-app`. Extra entries are logged and
-  ignored. No blanket multi-content rejection.
+- **[A]** `resources/read` may return a `contents[]`
+  array; the host requires **exactly one** entry whose
+  `uri` matches the declared `resourceUri` and whose MIME
+  parses as `text/html;profile=mcp-app` (v13). Zero or
+  more than one matching entry is a review error.
+  Non-matching entries are logged and ignored. No blanket
+  multi-content rejection.
 - **[T]** `MCPTask` holds **task metadata only** (v12). No
   cached terminal result envelope, no blob offload, no
   rehydration persistence. `tasks/result` is fetched **live**
@@ -107,17 +113,21 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
 - **[T]** Tasks-only over Streamable HTTP.
 - **[T]** Outstanding-task revalidation on HTTP 404 lives in
   Phase 4 (Tasks-specific), not Phase 0.
-- **[T]** Session loss during a **blocking
-  `tasks/result` wait** is handled deterministically (v12):
-  on HTTP 404, the host re-initializes the MCP session,
-  revalidates the task via `tasks/get` on the new session
-  (single retry budget), and either resumes the wait via a
-  fresh `tasks/result` (if non-terminal), or surfaces the
-  terminal envelope, or returns a clear "task lost across
-  re-init" error. The host does **not** spawn a second
-  concurrent waiter and does **not** silently downgrade to
-  polling. The single retry is bounded to one re-init per
-  wait.
+- **[T]** **No blocking `tasks/result` waiter in v1 (v13).**
+  Earlier revisions modeled "wait for result" as suspend
+  poller + issue blocking `tasks/result` + handle session
+  loss mid-wait. v13 cuts the blocking waiter entirely.
+  "Wait for result" is a UI mode on top of the **shared
+  poller**: the host keeps polling at `pollInterval`,
+  the UI shows a waiting state, and on the first terminal
+  status the host issues exactly one `tasks/result` to
+  fetch the envelope. Latency cost: at most one
+  `pollInterval` of extra completion delay. Code cost
+  saved: the entire wait-restart state machine, concurrent
+  wait/poll duality, and the dedicated re-init/retry
+  budget. Session re-init during polling uses the same
+  outstanding-task revalidation path as everywhere else
+  (Phase 4 work).
 - **[A]** Advisory manifest divergence **auto-repins** (v12).
   In the default (advisory) mode, the host renders the new
   manifest immediately, repins it, and surfaces a host-
@@ -156,17 +166,75 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
 - **[A]** Phase 1 pins a specific commit SHA on
   `KyleKincer:feat/mcp-apps` and a specific
   `@modelcontextprotocol/ext-apps` package release.
-- Phase 3 (`tool-input-partial`) remains optional and post-v1.
+- **[A]** **Vendored Apps and Tasks generated schemas
+  (v13).** Generated TypeScript types and JSON Schemas for
+  both extensions are vendored into the repo
+  (`packages/data-provider/src/mcp-apps/schemas/` and
+  `packages/data-provider/src/mcp-tasks/schemas/`),
+  pinned to spec dates `2026-01-26` (Apps stable) and
+  `2025-11-25` (Tasks experimental), and updated only via
+  reviewed PRs. v11 vendored Apps; v13 extends this to
+  Tasks because the experimental nature of the Tasks
+  surface and the precision of its ownership/metadata/
+  error semantics make drift a real risk.
+- **[A]** **Bootstrap trust is fail-closed (v13).** The
+  sandbox proxy never derives the host origin from
+  `document.referrer`, never accepts or sends `*` as
+  `targetOrigin`, and refuses to initialize if the
+  host-controlled bootstrap inputs (host origin, view ID,
+  per-view nonce) are absent or malformed. Operators are
+  required to deploy `proxy.html` with `frame-ancestors`
+  set to the LibreChat application origin; a startup
+  health check verifies the response header before Apps
+  capability is enabled.
+- **[A]** **Exactly-one matching `contents[]` entry
+  (v13).** `resources/read` may return a `contents[]`
+  array. The host picks the entry whose `uri` matches
+  the declared `resourceUri` and whose MIME parses as
+  `text/html;profile=mcp-app`. **Zero matches** is an
+  error. **More than one matching HTML entry** is also an
+  error. Non-matching extras are logged at info level and
+  ignored. v11's "log extras and ignore" rule remains for
+  non-matching entries; v13 closes the duplicate-match
+  ambiguity.
+- **[A]** **Required text fallback contract (v13).** Any
+  tool that declares `_meta.ui.resourceUri` MUST also
+  return a human-meaningful text summary in the
+  `CallToolResult.content` field. The host renders that
+  text on every non-render path: non-chat surfaces,
+  failed relay probes, unsupported browsers, and the
+  fallback card on session loss. If a server returns
+  empty or trivial `content`, the host renders a generic
+  "App is unavailable on this surface" card with
+  `toolInfo` rather than synthesizing data the model has
+  not seen. This contract is documented in the operator
+  guide and in the Apps server-author docs.
+- **[T]** **`model-immediate-response` is model plumbing,
+  not a user-visible assistant message (v13).** The
+  server-supplied string is fed into the model context as
+  the immediate tool result for the in-flight task call,
+  matching the spec's narrow scope for this provisional
+  metadata. The host does **not** emit an assistant-visible
+  placeholder, does not suppress the model from speaking
+  for that turn, and does not stage a separate "final
+  result" message that overwrites the placeholder. Users
+  see standard task-card chrome in the running-jobs UI.
 
 ## Goal
 
 Bring LibreChat to a useful, conformant subset of the MCP extensions for
 interactive UIs (**MCP Apps**, SEP-1865, stable 2026-01-26) and long-running
-operations (**MCP Tasks**, 2025-11-25, experimental). Apps Preview adopts
-upstream PR #11799 substantially as-is on the chat surface; Apps Hardened
-is a stricter **LibreChat Hardened App Profile**, **not** stable-spec
-parity (see decision 22). Tasks v1 is a deliberately narrow,
-capability-conditional, polling-first subset.
+operations (**MCP Tasks**, 2025-11-25, experimental). v13 collapses Apps
+Preview and Apps Hardened to a **single authoring profile** (self-contained
+HTML, no external assets, bridge-routed networking) and lets the modes
+differ only on **operator-gated policy strictness** (Wasm/eval permitted
+in Preview, blocked in Hardened; fullscreen optional in Preview, stripped
+in Hardened; legacy renderer retired on chat in Preview, retired across
+all surfaces in Hardened; manifestHash review applied in Hardened).
+Apps Hardened remains a stricter **LibreChat Hardened App Profile**,
+**not** stable-spec parity (see decision 22). Tasks v1 is a deliberately
+narrow, capability-conditional, polling-only subset — there is no
+blocking `tasks/result` waiter in v1 (decision 30 in v13).
 
 ## Closed go/no-go decisions
 
@@ -191,72 +259,83 @@ capability-conditional, polling-first subset.
    explicit detail entry or explicit "wait for result" — there is
    no opportunistic terminal-result fetch. No background
    API-process poller, no durable subscriber registry.
-4. **Authorization context identifier (v12 auth-revision
-   shape).** v1 binds task ownership to a stable
-   `authContextHash` over **stable identity inputs only**,
-   not over live bearer-token bytes and not over every
-   server-config edit. Inputs: `userId`, `mcpServerId`,
-   `credentialSource`,
-   `oauthSubject || apiKeyFingerprint`, **`authRevision`**.
+4. **Authorization context identifier (v13 derived
+   snapshot shape).** v1 binds task ownership to a stable
+   `authContextHash` over **stable identity inputs plus
+   the auth-relevant server-config snapshot**, not over
+   live bearer-token bytes and not over every server-config
+   edit. Inputs: `userId`, `mcpServerId`,
+   `credentialSource`, `oauthSubject || apiKeyFingerprint`,
+   and the **derived auth-relevant config snapshot**
+   covering server URL, transport type, OAuth issuer,
+   OAuth client_id, sorted OAuth scopes, API key reference
+   (opaque mapping ID, never the key bytes), and
+   per-user credential mapping policy.
    `headerAuthFingerprint` (over the live `Authorization`
-   header value) was in v10 and is **removed in v11** — it
-   would cause normal OAuth refresh to orphan in-flight
-   tasks. `configRevision` (every server-config edit) was
-   in v11 and is **replaced in v12** by `authRevision`.
-   `authRevision` increments **only** when **auth-relevant
-   server config changes** — server URL/endpoint, transport
-   type, auth scheme, OAuth issuer/client_id/scopes, API
-   key reference, per-user credential mapping policy.
-   Display name, description, icon, docs, default UI
-   settings, fallback height, and other non-auth metadata
-   edits do **not** bump `authRevision` and do **not**
-   orphan in-flight tasks. Token rotation does **not**
-   change `authContextHash`. Identity-level or
-   auth-relevant changes (user logout, server URL changed,
-   OAuth subject changes, API key rotated, OAuth scopes
-   changed, `authRevision` bumped) **do** change the hash
-   and invalidate ownership. The human-readable tuple
-   `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
-   is kept for logs and UI; the binding key is the hash.
+   header value) was in v10 and is **removed in v11**.
+   `configRevision` (every server-config edit) was in v11
+   and is **replaced in v12** by `authRevision`.
+   `authRevision` (a manually-bumped counter) is itself
+   **replaced in v13** by the derived snapshot — managing
+   a counter that must bump on auth-relevant edits and
+   never on cosmetic edits is exactly the kind of rule
+   that rots in maintenance, and a missed bump leaks
+   access to tasks that should be hidden. The v13 shape
+   hashes the auth-relevant fields directly, so the
+   ownership invariant is structural, not procedural.
+   Token rotation does **not** change `authContextHash`.
+   Identity-level or auth-relevant config changes (user
+   logout, server URL changed, transport type changed,
+   OAuth issuer/client/scopes changed, API key rotated
+   or remapped, credential mapping policy changed) **do**
+   change the hash and invalidate ownership. Display
+   name, description, icon, docs, default UI settings,
+   and fallback height are **not** in the snapshot and do
+   **not** orphan in-flight tasks. The human-readable
+   tuple `(userId, mcpServerId, oauthSubject ||
+   apiKeyFingerprint)` is kept for logs and UI; the
+   binding key is the hash.
 5. **`_meta.ui.domain` in v1.** Explicitly **unsupported**. Resources
    declaring `domain` are rejected at review time with a clear error
    message. v1 collapses everything to one `MCP_SANDBOX_ORIGIN`.
-6. **Asset policy: self-contained HTML in Hardened; no
-   relative external asset URLs in Preview.** Hardened v1
-   approves **bytes**, not origins. The resource HTML must
-   be self-contained: inline `<script>` and `<style>`,
+6. **Asset policy: self-contained HTML in both modes
+   (v13).** v1 approves **bytes**, not origins, in both
+   Preview and Hardened. The resource HTML must be
+   self-contained: inline `<script>` and `<style>`,
    `data:` images permitted, and **no** `<script src>`,
-   `<link href>`, `<img src>` to remote origins, **no**
-   `<base>`. Preview is more permissive on **absolute
-   HTTPS** external assets (honoring upstream
-   `_meta.ui.csp.resourceDomains` in the rendered CSP), but
-   v12 **also rejects relative external `src`/`href` in
-   Preview** because both modes now use `srcdoc` under
-   `MCP_SANDBOX_ORIGIN` and `about:srcdoc` resolves
-   relative URLs against the embedding document, not
-   against `ui://`. App authors who need external assets
-   in Preview must use absolute HTTPS URLs explicitly
-   listed in `resourceDomains`. Hardened ignores
-   `resourceDomains` entirely. The review pipeline rejects
-   any forbidden construct at review time.
-6a. **Network policy: bridge-routed by default; direct
-    browser networking is best-effort in Preview, blocked
-    in Hardened.** Hardened sets `connect-src 'none'`; the
-    inner view cannot `fetch`, XHR, or open a WebSocket.
-    `_meta.ui.csp.connectDomains` is parsed but **ignored**
-    in Hardened. Preview honors `connectDomains` in the
-    rendered CSP per upstream, but v12 documents direct
-    browser networking in Preview as **best-effort,
-    unsupported in production**: under the unified `srcdoc`
-    topology the inner-frame origin is opaque (`null`),
-    which breaks cookies, conservative CORS, OAuth, and
-    origin-based API allowlists. App authors are documented
-    to route through the bridge (`tools/call`,
-    `resources/read`, `ui/open-link`) for anything that
-    needs credentials or a stable browser-side identity in
-    either mode. Re-introducing reliable `connect-src` from
-    server metadata is post-v1 and depends on a
-    stable-origin design.
+   `<link href>`, `<img src>`, frame `src`,
+   `<source>`/`<track>`/`<video>`/`<audio>` `src`, or
+   ES module `import` to remote origins (relative or
+   absolute), and **no** `<base>`. Earlier revisions
+   allowed Preview to honor absolute HTTPS URLs via
+   `_meta.ui.csp.resourceDomains`; v13 cuts that surface
+   because it is the single biggest source of "works in
+   Preview, breaks in Hardened" cases under the unified
+   `srcdoc` topology, and the supply-chain attack surface
+   on remote assets is at odds with the bytes-not-origins
+   approval model. The review pipeline rejects any
+   forbidden construct at review time. `resourceDomains`,
+   `frameDomains`, and `baseUriDomains` metadata is parsed
+   but **never** installed in the rendered CSP in either
+   mode.
+6a. **Network policy: bridge-routed only in both modes
+    (v13).** v1 sets `connect-src 'none'` in the inner CSP
+    in **both** Preview and Hardened. The inner view
+    cannot `fetch`, XHR, or open a WebSocket directly.
+    `_meta.ui.csp.connectDomains` is parsed but **never**
+    installed in the rendered CSP in either mode.
+    Earlier revisions allowed Preview to honor
+    `connectDomains` per upstream; v13 cuts that surface
+    because the unified `srcdoc` topology forces an
+    opaque-origin (`null`) inner frame, which breaks
+    cookies, conservative CORS, OAuth, and origin-based
+    API allowlists — `connect-src` ends up being
+    best-effort even when populated. App authors route
+    through the bridge (`tools/call`, `resources/read`,
+    `ui/open-link`) for anything that needs credentials
+    or a stable browser-side identity. Re-introducing
+    reliable `connect-src` from server metadata is post-v1
+    and depends on a stable-origin design.
 6b. **Approval is over a launch manifest, not just HTML.**
     `manifestHash` is the canonical hash over: decoded HTML,
     host-filtered effective sandbox flags, effective iframe
@@ -265,15 +344,24 @@ capability-conditional, polling-first subset.
     `resourceUri`, and host trust-policy version. Both review
     and remount records bind to it. Divergence on any policy
     axis (not just bytes) triggers re-approval.
-6c. **Content decoding pipeline.** `resources/read` results
-    are decoded in this fixed order: validate
-    pick the `contents[]` entry whose `uri` matches
+6c. **Content decoding pipeline (v13 exactly-one-match).**
+    `resources/read` results are decoded in this fixed
+    order: walk the `contents[]` array; collect every
+    entry whose `uri` exactly matches
     `_meta.ui.resourceUri` and whose `mimeType` parses as
-    `text/html;profile=mcp-app` (parameter order normalized);
-    log and ignore extras; decode `text` verbatim or
-    base64-decode `blob` under `MCP_APPS_MAX_HTML_BYTES`;
-    UTF-8 validate; run the self-contained-HTML validator;
-    compute `manifestHash`.
+    `text/html;profile=mcp-app` (parameter order
+    normalized); **fail review if zero or more than one
+    such entry is present**; for the single matching entry
+    log and ignore non-matching siblings; decode `text`
+    verbatim or base64-decode `blob` under
+    `MCP_APPS_MAX_HTML_BYTES`; UTF-8 validate; run the
+    self-contained-HTML validator; compute `manifestHash`.
+    v11 accepted multi-content responses with a
+    "log extras and ignore" rule; v13 keeps that for
+    non-matching entries but closes the duplicate-match
+    ambiguity (which would otherwise be nondeterministic
+    if two entries shared the same declared URI and MIME
+    but carried different bytes).
 6d. **Trust chrome is mandatory.** `_meta.ui.prefersBorder`
     is **ignored** in v1; every Apps view renders inside a
     persistent host-controlled border with identity chrome
@@ -415,32 +503,54 @@ capability-conditional, polling-first subset.
       (notification throttle per view).
     - `MCP_APPS_INITIALIZE_TIMEOUT_MS = 5000` (the relay
       probe fold-in deadline).
-18. **`authContextHash` canonicalization.** Compute as
+18. **`authContextHash` canonicalization (v13 derived
+    snapshot).** Compute as
     `sha256(canonicalJSON(authPayload))` where
     `canonicalJSON` is RFC 8785 JCS-equivalent (sorted
-    keys, no whitespace, no insignificant differences) and
-    `authPayload = { userId, mcpServerId, credentialSource,
-    oauthSubject, apiKeyFingerprint, authRevision }`.
-    All six fields are required; missing fields are
+    keys, no whitespace, no insignificant differences)
+    and `authPayload` is the union of identity inputs and
+    a derived auth-relevant config snapshot:
+
+    ```
+    authPayload = {
+      userId,
+      mcpServerId,
+      credentialSource,
+      oauthSubject,        // OAuth `sub`, stable across refresh
+      apiKeyFingerprint,   // sha256(api_key), stable until rotation
+      authConfigSnapshot: {
+        serverUrl,         // string
+        transportType,     // "streamable-http" | ...
+        oauthIssuer,       // string | null
+        oauthClientId,     // string | null
+        oauthScopes,       // sorted string[] | null
+        apiKeyRef,         // opaque mapping ID | null
+        credentialMappingPolicy, // "shared" | "per-user" | null
+      },
+    }
+    ```
+
+    All identity fields are required; missing fields are
     explicit `null` so the hash distinguishes "absent"
     from "empty". `oauthSubject` is the OAuth `sub` claim
     captured at task creation; `apiKeyFingerprint` is
     `sha256(api_key)`. **Exactly one of `oauthSubject` or
     `apiKeyFingerprint` is non-null per task** (the other
     is `null`); `credentialSource` says which.
-    `authRevision` is the server's monotonic
-    auth-relevant-config revision counter; it bumps **only**
-    on auth-relevant config changes (URL, transport, auth
-    scheme, OAuth issuer/client/scopes, API key reference,
-    per-user credential mapping policy) and explicitly
-    **does not** bump on display-name, description, icon,
-    docs, default-UI-settings, or other non-auth metadata
-    edits. `headerAuthFingerprint` is **not** in the
-    payload — see decision 4 for why. The function lives
-    in `packages/api` and has a dedicated unit-test corpus
-    that includes named "OAuth refresh does not change the
-    hash" and "non-auth config edits do not change the
-    hash" test cases.
+    `authConfigSnapshot` is the **derived** snapshot of
+    auth-relevant server config at task creation. The
+    snapshot is computed mechanically from the canonical
+    config object in `packages/data-schemas`; application
+    code never bumps a manual revision counter. Display
+    name, description, icon, docs, default UI settings,
+    and other cosmetic fields are explicitly **not** in
+    the snapshot. `headerAuthFingerprint` is **not** in
+    the payload — see decision 4 for why. The function
+    lives in `packages/api` and has a dedicated unit-test
+    corpus that includes named "OAuth refresh does not
+    change the hash", "non-auth config edits do not
+    change the hash", and "auth-relevant edits change the
+    hash" test cases against fixture configs.
 19. **Adopt upstream PR #11799 + `dev` transport fixes as
     the substrate, then layer the Hardened delta.**
     Implementation does not parallel-build. Phase 0 starts
@@ -589,33 +699,96 @@ capability-conditional, polling-first subset.
       cannot identify requestors, instead of universally
       promising a global jobs panel that some servers
       cannot safely back.
-30. **Wait-restart behavior on session loss (v12).**
-    A blocking `tasks/result` wait can be interrupted by
-    HTTP 404 → re-init mid-flight. The host's behavior is:
-    1. The blocking `tasks/result` request fails with the
-       404 / session-lost error.
-    2. The host re-initializes the MCP session (reusing
-       Phase 4's outstanding-task revalidation path).
-    3. The host calls `tasks/get` for the affected
-       `taskId` on the new session **once**.
-    4. If `tasks/get` reports non-terminal status, the
-       host issues **one** fresh `tasks/result` (the
-       single retry budget) on the new session and the
-       wait resumes from the user's perspective.
-    5. If `tasks/get` reports terminal status, the host
-       issues `tasks/result` once and surfaces the
-       envelope.
-    6. If `tasks/get` reports "not found" (server lost
-       the task), the host marks the row terminal-with-
-       error and surfaces a clear "task lost across
-       re-init" message. No further retry.
-    7. If the second `tasks/result` also fails, the host
-       does **not** retry again and does **not** silently
-       downgrade to polling; it surfaces a clear failure
-       and the user can manually retry.
-    Goals: no duplicate concurrent waiters; no surprise
-    polling of a wait the user didn't reopen; one
-    deterministic re-init budget per wait.
+30. **No blocking `tasks/result` waiter; "wait" is a UI
+    mode on top of the shared poller (v13).** Earlier
+    revisions modeled "wait for result" as: suspend
+    poller, issue blocking `tasks/result`, handle session
+    loss mid-wait with a single re-init / `tasks/get` /
+    retry budget. v13 cuts the blocking waiter entirely.
+    "Wait for result" is a UI state on top of the shared
+    poller: the host keeps polling `tasks/get` at
+    `pollInterval`, the UI shows a waiting state, and on
+    the first terminal status the host issues exactly one
+    `tasks/result` to fetch the envelope. Latency cost:
+    at most one `pollInterval` of additional completion
+    delay. Code cost saved: the entire wait-restart state
+    machine, concurrent wait/poll duality, dedicated
+    re-init/retry budget, and the test surface around
+    them. Session re-init during polling uses the same
+    outstanding-task revalidation path as everywhere else
+    (Phase 4). This is the largest single Tasks
+    simplification in v13.
+
+31. **Bootstrap trust contract (v13).** The sandbox proxy
+    (`proxy.html` served from `MCP_SANDBOX_ORIGIN`)
+    bootstraps with a **fail-closed** trust contract:
+    - The proxy never derives the host origin from
+      `document.referrer`, never accepts or sends
+      `'*'` as a `targetOrigin`, and never partial-matches
+      origins.
+    - Host origin, view ID, and the per-view nonce arrive
+      through a host-controlled bootstrap channel: a
+      single `host-bootstrap` postMessage from the
+      LibreChat application origin sent immediately after
+      the outer iframe's `load`, validated against an
+      operator-configured allowlist of expected host
+      origins. The proxy refuses to initialize if the
+      message is absent within `MCP_APPS_INITIALIZE_TIMEOUT_MS`,
+      malformed, or arrives from any other origin.
+    - Operators must deploy `proxy.html` with at minimum:
+      `Content-Security-Policy: frame-ancestors
+      <librechat-origin>`, `Cache-Control` set to
+      no-cache, and `Cross-Origin-Resource-Policy:
+      same-site` (or stricter). A startup health check
+      fetches `proxy.html` from `MCP_SANDBOX_ORIGIN`,
+      verifies these headers, and refuses to enable Apps
+      capability advertisement if any required header is
+      absent. The check runs on Apps capability boot and
+      on every `MCP_SANDBOX_ORIGIN` config reload.
+    - Bootstrap errors surface in operator logs with the
+      missing field; users see the standard text
+      fallback card.
+32. **Single authoring profile across modes (v13).**
+    Preview and Hardened share one HTML/asset/networking
+    contract: self-contained HTML, no external assets, no
+    direct browser networking, bridge-routed only. The
+    modes differ on **policy strictness only**:
+    - Wasm/eval permitted in Preview, blocked at CSP in
+      Hardened.
+    - Fullscreen optional in Preview behind operator
+      gate, stripped in Hardened.
+    - Legacy `UIResourceRenderer` retired on chat in
+      Preview, retired across all surfaces in Hardened.
+    - `manifestHash` review and pinning active in
+      Hardened, scaffolded but inactive in Preview
+      (Preview ships without manifest review; that is a
+      Hardened-only feature).
+    - Operator gating: Preview is the default opt-in
+      ("turn on Apps"); Hardened is a stricter
+      operator-elected mode ("turn on the LibreChat
+      Hardened App Profile").
+    There is **no** Preview-only authoring contract. App
+    authors who target Preview today work without changes
+    when an operator promotes to Hardened (modulo Wasm/
+    eval and fullscreen, which are documented).
+33. **Required text fallback contract (v13).** Servers
+    that mark tools with `_meta.ui.resourceUri` MUST also
+    return a human-meaningful text summary in
+    `CallToolResult.content`. The host renders that text
+    on every non-render path:
+    - Non-chat surfaces (share, search, plugin-rendered).
+    - Failed `ui/initialize` relay probes.
+    - Browsers that fail the runtime relay self-test.
+    - The bootstrap-trust health-check failure mode.
+    - Hardened mode without a passing manifest review.
+    Tools that return empty or trivial `content` cause
+    the host to render a single generic "App is
+    unavailable on this surface" card built from
+    `toolInfo`; the host does **not** synthesize content
+    on the model's behalf. This contract is documented in
+    the operator guide and in the Apps server-author
+    docs; it is also the v1 single-fallback-surface rule
+    that keeps the client implementation simple.
 
 ## Pinned protocol versions
 
@@ -647,12 +820,12 @@ v1 rejects non-`user` roles with a clear error.
 | Result-time UI-resource switching | Stable spec defers |
 | State restoration across remounts | Stable spec defers |
 | `ui/message` with non-`user` roles | Stable schema is `user`-only |
-| External assets in resource HTML (Hardened) | Hardened v1 approves bytes, not origins; HTML must be self-contained |
-| Relative external `src`/`href` in resource HTML (Preview and Hardened) | Under unified `srcdoc` topology, relative URLs resolve against `MCP_SANDBOX_ORIGIN`, not against `ui://` |
-| `_meta.ui.csp.resourceDomains` / `frameDomains` / `baseUriDomains` (Hardened) | Corresponding HTML constructs forbidden in Hardened |
-| `_meta.ui.csp.connectDomains` (Hardened) | Hardened blocks direct browser networking; route via `tools/call` / `resources/read` / `ui/open-link` |
-| Reliable direct in-app `fetch` / XHR / WebSocket (Preview) | Best-effort only; inner-frame origin is `null`, no stable origin for CORS / cookies / OAuth |
-| Direct in-app `fetch` / XHR / WebSocket (Hardened) | Cut entirely; bridge-routed only |
+| External assets in resource HTML (both modes, v13) | v1 approves bytes, not origins; HTML must be self-contained in Preview and Hardened |
+| `_meta.ui.csp.resourceDomains` / `frameDomains` / `baseUriDomains` (both modes) | Corresponding HTML constructs forbidden in both Preview and Hardened (v13) |
+| `_meta.ui.csp.connectDomains` (both modes) | Both modes block direct browser networking; route via `tools/call` / `resources/read` / `ui/open-link` (v13) |
+| Direct in-app `fetch` / XHR / WebSocket (both modes) | Cut entirely in both Preview and Hardened (v13); bridge-routed only |
+| Blocking `tasks/result` waiter | Cut in v13; "wait for result" is a UI mode on top of the shared poller; final fetch happens once on terminal status |
+| User-visible assistant placeholder for `model-immediate-response` | Cut in v13; the field is fed to the model as the immediate tool result per spec, but is not surfaced as an assistant-visible turn |
 | `_meta.ui.prefersBorder = false` | Trust chrome is mandatory in v1 |
 | Opportunistic terminal-result persistence in Tasks | Cut to reduce hidden retention; `tasks/result` only on detail entry / explicit wait |
 | Host-side terminal-result cache (any layer) | Cut in v12; `tasks/result` is fetched live every time. Removes blob offload, semantic-rehydration persistence, and an extra retention boundary |
@@ -797,16 +970,19 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   it. Cutting opportunistic save eliminates a hidden
   retention layer and matches the spec's normative status
   path more cleanly.
-- **Single-path "wait for result."** When the user explicitly
-  enters a blocking wait state (detail-row "wait for result"),
-  the host **suspends `tasks/get` polling for that task** and
-  relies on a single `tasks/result` call. The spec says
-  `tasks/result` blocks until terminal status, so polling on
-  top of it is wasteful and creates unnecessary concurrent
-  long-lived requests. Polling resumes only if (a) the
-  `tasks/result` call fails, (b) the user cancels the wait, or
-  (c) the user navigates away from the wait state. The user
-  sees the same UX either way; the host saves a stream.
+- **"Wait for result" is a UI mode on top of the shared
+  poller (v13).** When the user clicks "wait for result"
+  on an in-flight task, the host does **not** issue a
+  blocking `tasks/result`. Instead, the UI switches to a
+  waiting state and the shared `tasks/get` poller keeps
+  running at `pollInterval`; on the first terminal status
+  the host issues exactly one `tasks/result` to fetch the
+  envelope. This avoids concurrent wait/poll duality and
+  removes the entire wait-restart state machine that
+  earlier revisions introduced for session loss mid-wait.
+  Latency cost: at most one `pollInterval` of additional
+  completion delay. UX cost: none — the user sees the
+  same waiting affordance.
 - **No host-side terminal-result cache (v12).** v1 does
   **not** cache `tasks/result` payloads. The `MCPTask`
   collection holds task **metadata only** (`taskId`,
@@ -838,45 +1014,65 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
     with their own `taskId` — meta tag not required.
   - **`tasks/result` *response* MUST carry the meta tag** because the
     underlying request's result envelope has no `taskId` of its own.
-- **Result fidelity (v12).** `tasks/result` is fetched live
-  from the server and forwarded to the requester without
-  host-side rehydration. The server is responsible for the
-  same successful result or JSON-RPC error shape the
-  underlying request would have produced, including
-  `_meta` preservation (see view-path rules in the Data
-  boundary section). The host does not re-encode or
-  pointerize; nothing is cached, so there is no
+- **Result fidelity (v12, retained in v13).** `tasks/result`
+  is fetched live from the server and forwarded to the
+  requester without host-side rehydration. The server is
+  responsible for the same successful result or JSON-RPC
+  error shape the underlying request would have produced,
+  including `_meta` preservation (see view-path rules in
+  the Data boundary section). The host does not re-encode
+  or pointerize; nothing is cached, so there is no
   rehydration step. View-path forwarding of the live
   envelope must preserve `_meta` exactly as the server
   returned it, including
-  `_meta["io.modelcontextprotocol/related-task"]`.
+  `_meta["io.modelcontextprotocol/related-task"]`. v13
+  removes the dedicated blocking-waiter path for
+  `tasks/result`; the only contexts that issue
+  `tasks/result` are explicit detail entry on a terminal
+  row and the shared poller's one-shot terminal fetch
+  when "wait for result" is the active UI state.
 - Status notifications are optional; `pollInterval` is advisory; the
   host treats both as hints.
 - Servers may return
   `_meta["io.modelcontextprotocol/model-immediate-response"]` — a
-  model-facing string letting the model continue reasoning while the
-  task runs.
-- **Authorization context binding via `authContextHash`.** Task
-  access is bound to a stable hash over the **normalized
-  effective auth-relevant configuration** at task creation:
-  `userId`, `mcpServerId`, `credentialSource`, exactly one of
-  `oauthSubject` or `apiKeyFingerprint`, and `authRevision`
-  (the server's monotonic auth-relevant-config counter that
-  bumps **only** on auth-relevant changes — URL, transport,
-  auth scheme, OAuth issuer/client/scopes, API key reference,
-  per-user credential mapping policy). Display-name,
-  description, icon, docs, default-UI-settings, and other
-  non-auth metadata edits do **not** bump `authRevision` and
-  do **not** orphan in-flight tasks. The human-readable
-  tuple `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
-  is kept for logs and UI but is **not** the binding key. Any
-  change in the auth-relevant configuration (or token-rotation
-  events that are bypassed by design) changes the hash and
-  invalidates ownership. This guards against the
-  LibreChat-specific risk surface around shared server
-  definitions and per-user credential leakage that recent
-  advisories flagged, while keeping ordinary OAuth refresh
-  and unrelated config edits ownership-stable.
+  provisional, model-facing string letting the model continue
+  reasoning while the task runs. **v13 treats this as model
+  plumbing only.** When present, the agent passes the string to
+  the model as the immediate tool result for that task call;
+  there is no user-visible assistant placeholder, no
+  model-suppression for the turn, and no separate "final
+  result" assistant message that overwrites the placeholder.
+  The user sees a normal task card in the running-jobs UI.
+- **Authorization context binding via `authContextHash`
+  (v13 derived snapshot).** Task access is bound to a stable
+  hash over identity inputs and a **derived auth-relevant
+  config snapshot** at task creation: `userId`,
+  `mcpServerId`, `credentialSource`, exactly one of
+  `oauthSubject` or `apiKeyFingerprint`, plus the
+  snapshot covering server URL, transport type, OAuth
+  issuer/client_id/sorted-scopes, API key reference (opaque
+  mapping ID, never key bytes), and per-user credential
+  mapping policy. The snapshot is computed mechanically
+  from the canonical config object; v13 deliberately
+  removes the v12 `authRevision` counter because requiring
+  application code to bump exactly once on auth-relevant
+  edits and never on cosmetic edits is the kind of
+  procedural rule that rots in maintenance — a missed bump
+  leaks access to tasks that should be hidden, an extra
+  bump makes tasks vanish "mysteriously". Hashing the
+  snapshot directly makes the ownership invariant
+  structural rather than procedural. Display name,
+  description, icon, docs, default UI settings, and
+  fallback height are explicitly **not** in the snapshot
+  and do **not** orphan in-flight tasks. Token rotation
+  does not change the hash. The human-readable tuple
+  `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
+  is kept for logs and UI but is **not** the binding key.
+  This guards against the LibreChat-specific risk surface
+  around shared server definitions and per-user credential
+  leakage flagged by recent advisories, while keeping
+  ordinary OAuth refresh and cosmetic config edits
+  ownership-stable.
 - **Streamable HTTP only.** v1 does not run Tasks over stdio, WS, or
   SSE. Transport reuses `MCP-Session-Id`, sends
   `MCP-Protocol-Version`, and handles HTTP 404 → new MCP session.
@@ -1397,29 +1593,47 @@ It enforces:
 - Inner-view CSP delivered via `<meta http-equiv="Content-Security-
   Policy">` injected before the closing `</head>` of the `html`
   payload.
-- v1 policy is **strict by construction** because the resource is
-  required to be self-contained (see Asset policy below) **and**
-  no direct browser networking is allowed:
+- v13 policy is **strict by construction in both modes** because
+  the authoring profile requires self-contained HTML and bridge-
+  routed networking (see Asset policy below).
+- **Preview** inner CSP (Wasm/eval permitted):
   ```
-  default-src 'none';
-  script-src  'unsafe-inline';
-  style-src   'unsafe-inline';
-  img-src     data:;
-  connect-src 'none';
-  base-uri    'none';
-  form-action 'none';
+  default-src     'none';
+  script-src      'unsafe-inline' 'unsafe-eval' wasm-unsafe-eval;
+  style-src       'unsafe-inline';
+  img-src         data:;
+  connect-src     'none';
+  base-uri        'none';
+  form-action     'none';
   ```
-  `'unsafe-inline'` is necessary because the resource ships its
-  scripts and styles inline; with no remote script origins
-  permitted, the XSS surface is bounded to whatever is in the
-  approved bytes (which is exactly what `manifestHash` protects).
-- **No directive draws from server metadata in v1.**
-  `_meta.ui.csp.connectDomains`, `resourceDomains`,
-  `frameDomains`, and `baseUriDomains` are all **ignored**.
-  v1 forbids the HTML constructs the latter three would
-  permit, and v1 cuts direct browser networking, which is
-  what the former would permit. The fields are still parsed
-  (so v2 can re-introduce them) but never installed.
+- **Hardened** inner CSP (Wasm/eval blocked):
+  ```
+  default-src     'none';
+  script-src      'unsafe-inline';
+  style-src       'unsafe-inline';
+  img-src         data:;
+  connect-src     'none';
+  base-uri        'none';
+  form-action     'none';
+  ```
+- The two policies are identical except for the
+  `script-src` `'unsafe-eval' wasm-unsafe-eval` clauses,
+  which Hardened removes. Everything else (asset rules,
+  network rules, `<base>` rules, form rules) is identical
+  across modes.
+- `'unsafe-inline'` is necessary because the resource ships
+  its scripts and styles inline; with no remote script
+  origins permitted, the XSS surface is bounded to whatever
+  is in the approved bytes (which is exactly what
+  `manifestHash` protects in Hardened).
+- **No directive draws from server metadata in v1, in
+  either mode (v13).** `_meta.ui.csp.connectDomains`,
+  `resourceDomains`, `frameDomains`, and `baseUriDomains`
+  are all **ignored**. v1 forbids the HTML constructs the
+  latter three would permit, and v1 cuts direct browser
+  networking, which is what the former would permit. The
+  fields are still parsed (so v2 can re-introduce them)
+  but never installed.
 - All app network access flows through the bridge:
   `tools/call`, `resources/read`, and `ui/open-link`. Apps
   that need to call out to a third-party API expose that as
@@ -1428,13 +1642,21 @@ It enforces:
 - Documented `<meta>`-CSP limitations: `sandbox`, `frame-ancestors`,
   `report-uri` cannot be expressed. `sandbox` uses the iframe
   attribute; `frame-ancestors` is enforced by the proxy.html
-  response header on the sandbox origin; `report-uri` is unavailable
-  in v1.
+  response header on the sandbox origin (v13 startup health
+  check verifies the header is present); `report-uri` is
+  unavailable in v1.
 
-### Asset policy (v1: self-contained HTML only)
+### Asset policy (v13: self-contained HTML in both modes)
 
-v1 approves **bytes**, not origins. The review pipeline parses
-each candidate `ui://` resource and **rejects** any of:
+v13 approves **bytes**, not origins, in **both** Preview and
+Hardened. Earlier revisions allowed Preview to honor absolute
+HTTPS URLs via `_meta.ui.csp.resourceDomains`; v13 cuts that
+surface because it is the single biggest source of "works in
+Preview, breaks in Hardened" under the unified `srcdoc`
+topology. App authors target one profile.
+
+The review pipeline parses each candidate `ui://` resource as
+HTML and **rejects** any of these declarative constructs:
 
 - `<script src=…>` (absolute or relative).
 - `<link href=…>` for stylesheets, prefetches, modulepreloads,
@@ -1443,37 +1665,45 @@ each candidate `ui://` resource and **rejects** any of:
 - `<iframe src=…>`, `<frame src=…>`, `<embed>`, `<object>`,
   `<source>`, `<track>`, `<video>`, `<audio>` with remote `src`.
 - `<base href=…>` tags (avoid retargeting relative resolution).
-- ES module `import` / dynamic `import()` to remote URLs (the
-  CSP `script-src` already blocks them at runtime; the review
-  pipeline rejects them at review time so the failure is
-  explicit, not a runtime mystery).
 
 What the resource **may** include:
 
 - Inline `<script>` and `<style>` blocks (subject to byte
-  hashing inside the manifest).
+  hashing inside the manifest in Hardened).
 - `data:` images.
 
-What the resource **may not** do over the network:
+**Runtime-enforced rules (CSP, not review).** The validator
+does **not** try to statically analyze inline JS for dynamic
+imports, `fetch`, `eval`, or `WebAssembly.instantiate`. Doing
+so reliably is hard and has high false-positive cost. v13
+relies on the inner-view CSP at runtime instead:
 
-- Direct `fetch`, XHR, or WebSocket from view JS. The CSP
-  default is `connect-src 'none'`. App authors call MCP
-  `tools/call` or `resources/read` through the bridge for
-  any server interaction, or use `ui/open-link` for
-  user-driven navigation/downloads.
+- Dynamic ES `import()` to remote URLs is blocked because
+  `script-src` lacks remote origins.
+- `fetch`, XHR, WebSocket are blocked by `connect-src 'none'`.
+- `eval` and `new Function` are blocked in Hardened by the
+  absence of `'unsafe-eval'`; permitted in Preview.
+- `WebAssembly.instantiate` is blocked in Hardened by the
+  absence of `wasm-unsafe-eval`; permitted in Preview.
 
-Why this is tighter than v6: under v6's "absolute HTTPS in
-`resourceDomains` is fine" rule, the host-side approval was over
-the HTML only, while the actually-executing JS could change
-under a stable URL. That made hash pinning advisory-at-best and
-contradicted the "browser receives an already-approved payload"
-claim. Under v7, hash pinning is meaningful: the approved bytes
-are everything that runs.
+This is cheaper to reason about than a static-analysis pass
+and avoids the whole class of "validator fails on a perfectly
+safe inline string that happens to contain `import(`" false
+positives.
+
+Why bytes-not-origins is the right v1 model: under earlier
+"absolute HTTPS in `resourceDomains` is fine" proposals, the
+host-side approval was over the HTML only, while the actually-
+executing JS could change under a stable URL. That made hash
+pinning advisory-at-best and contradicted the "browser
+receives an already-approved payload" claim. With external
+assets banned in both modes, hash pinning is meaningful in
+Hardened: the approved bytes are everything that runs.
 
 App authors bundle their JS and CSS inline. This is a real
-constraint on app authors, but it removes the entire
-supply-chain attack surface from v1 review and lets the host
-make a truthful claim about what users actually run.
+constraint, but it removes the entire supply-chain attack
+surface from v1 review and lets the host make a truthful
+claim about what users actually run.
 
 `about:srcdoc` resolves relative URLs against the embedding
 document, not against `ui://`. With external assets banned,
@@ -1594,7 +1824,16 @@ authPayload = {
                     "system_oauth" | "anonymous" | null,
   oauthSubject: string | null,        // OAuth `sub` claim, stable across refresh
   apiKeyFingerprint: string | null,   // sha256(api_key), stable until rotation
-  authRevision: string | null,        // monotonic; bumps only on auth-relevant config changes
+  authConfigSnapshot: {               // derived from server config at task creation
+    serverUrl: string | null,         // canonical URL form
+    transportType: string | null,     // "streamable-http" | ...
+    oauthIssuer: string | null,
+    oauthClientId: string | null,
+    oauthScopes: string[] | null,     // sorted, deduped
+    apiKeyRef: string | null,         // opaque mapping ID, never key bytes
+    credentialMappingPolicy:          // policy that decides per-user vs shared credential
+      "shared" | "per-user" | null,
+  } | null,
 }
 authContextHash = sha256(canonicalJSON(authPayload))
 ```
@@ -1609,26 +1848,34 @@ rotates that value during normal operation and would orphan
 in-flight tasks under v10's earlier shape. v11's identity-
 only inputs survive token rollover.
 
-`authRevision` (v12) replaces v11's `configRevision`. The
-v11 shape bumped on every server-config edit and would have
-orphaned in-flight tasks for purely cosmetic edits (display
-name, docs, default UI settings, fallback height, icon). v12
-restricts the input to a counter that bumps **only** on
-auth-relevant config changes:
+`authConfigSnapshot` (v13) replaces v12's `authRevision`
+counter. The v12 shape required application code to bump a
+counter exactly once on every auth-relevant config edit and
+never on cosmetic edits, which is fragile in maintenance —
+a missed bump leaks access to tasks that should be hidden,
+an extra bump makes tasks disappear. v13 hashes the
+auth-relevant fields directly, so the ownership invariant is
+**structural**: if any of the snapshot fields changes, the
+hash changes; if none of them change, the hash is stable.
 
-- Server URL or endpoint changes.
-- Transport type changes (e.g. SSE → Streamable HTTP).
-- Auth scheme changes (OAuth → API key, etc.).
-- OAuth issuer, client_id, or allowed-scopes changes.
-- API key reference (mapping) changes.
-- Per-user credential mapping policy changes.
+What is **in** the snapshot:
 
-It does **not** bump on display name, description, icon,
-docs, default UI settings, fallback height, or any other
-non-auth metadata edit. Servers expose `authRevision` from
-their config layer; `packages/data-schemas` owns the
-property and a migration that initializes existing rows to
-`authRevision = "1"`.
+- `serverUrl`: canonicalized server endpoint URL.
+- `transportType`: e.g. `"streamable-http"`.
+- `oauthIssuer`, `oauthClientId`, `oauthScopes` (sorted,
+  deduped).
+- `apiKeyRef`: opaque mapping ID; never the key bytes
+  themselves.
+- `credentialMappingPolicy`: shared vs per-user credential
+  policy.
+
+What is **not** in the snapshot (and therefore does not
+orphan tasks):
+
+- Display name, description, icon, documentation links.
+- Default UI settings (fullscreen permission flag, default
+  shrinkWrap, fallback height, etc.).
+- Cosmetic admin metadata (created-by, tags, sort order).
 
 `canonicalJSON` follows RFC 8785 JCS: lexicographically sorted
 keys, no insignificant whitespace, no trailing commas, UTF-8
@@ -1636,9 +1883,10 @@ output. Missing fields are explicit `null`, never omitted, so
 "absent" and "empty" are distinguishable. The function lives in
 `packages/api` with a dedicated unit-test corpus covering field
 permutations, null vs missing, round-trip equality, and named
-"OAuth refresh does not change `authContextHash`" and
-"non-auth config edits do not change `authContextHash`" test
-cases.
+"OAuth refresh does not change `authContextHash`",
+"cosmetic config edits do not change `authContextHash`", and
+"auth-relevant edits do change `authContextHash`" test cases
+against fixture configs.
 
 ## Data boundary rules
 
@@ -1898,7 +2146,7 @@ on what `dev` does **not** cover.
   allowlists, per-user task quotas, result-size caps).
   Defaults lean toward denial.
 
-### Phase 1 — Patch #11799, unify topology, relay validation, scaffold delta (≈2–2.5 weeks)
+### Phase 1 — Patch #11799, unify topology, unified authoring profile, relay validation, scaffold Hardened delta (≈2.5–3 weeks)
 
 End of phase: PR #11799 patched onto the working branch with
 the unified topology applied (v11 decision); sandbox bootstrap green for
@@ -2029,29 +2277,84 @@ locally; we do not block on upstream cleanup.
   `@modelcontextprotocol/ext-apps/app-bridge@1.7.1` measures
   ~377 KB minified, dominated by Zod.
 
+**Authoring-profile enforcement (active in both modes,
+v13):**
+
+- Self-contained-HTML validator + content-decoding pipeline
+  (MIME, `text`/`blob`, UTF-8, exactly-one-match
+  `contents[]` selection). Active in Preview and Hardened.
+- Inner-view CSP injection: Preview profile
+  (`'unsafe-inline' 'unsafe-eval' wasm-unsafe-eval` on
+  `script-src`), Hardened profile (`'unsafe-inline'`
+  only). `connect-src 'none'` and `default-src 'none'`
+  identical across modes.
+- Server metadata `_meta.ui.csp.connectDomains`,
+  `resourceDomains`, `frameDomains`, `baseUriDomains`
+  parsed but never installed in either mode.
+
 **Hardened delta scaffolds (land disabled, no UX impact in
 Preview):**
 
 - `MCPResourceReview` collection scaffold +
-  self-contained-HTML validator + content-decoding pipeline
-  (MIME, `text`/`blob`, UTF-8, `contents[]` selection).
-  Behind `MCP_APPS_MODE="hardened"` (no-op when off).
-- `MCPAppLaunchManifest` builder + canonical-JSON hasher
+  `MCPAppLaunchManifest` builder + canonical-JSON hasher
   (RFC 8785). Unit tests cover determinism across field
-  orderings against a fixture corpus.
+  orderings against a fixture corpus. Review/pin behavior
+  gated behind `MCP_APPS_MODE="hardened"` (no-op when
+  off); the validator and decoding pipeline above are
+  always on.
 - Extend the inherited `mcp_app` artifact schema in
   `packages/data-provider` and `packages/data-schemas` with
   optional `manifestHash` and `authContextHash` fields. Only
   Hardened writes to them; Preview leaves them unset.
 - Operational-limits parser. Settings present even though
   most enforcement points are gated on Hardened.
-- `authContextHash` canonicalizer (`packages/api`) +
-  unit-test corpus (incl. the "OAuth refresh does not
-  change the hash" test **and** the "non-auth config edits
-  do not change the hash" test, v12).
+- `authContextHash` canonicalizer (`packages/api`) over the
+  v13 derived snapshot + unit-test corpus (OAuth-refresh
+  invariance, cosmetic-edit invariance, auth-relevant-edit
+  sensitivity).
 - Tests with `mongodb-memory-server` + real
   `@modelcontextprotocol/sdk` + Playwright cross-origin
   iframes.
+
+**Bootstrap trust contract (active, v13):**
+
+- Sandbox proxy `proxy.html` ships with the fail-closed
+  bootstrap: a `host-bootstrap` postMessage from the
+  LibreChat application origin delivers host origin, view
+  ID, and per-view nonce; the proxy refuses to initialize
+  if the message is absent within
+  `MCP_APPS_INITIALIZE_TIMEOUT_MS` or arrives from a
+  non-allowed origin; no `document.referrer` derivation;
+  no `*` `targetOrigin`.
+- Startup health check fetches `proxy.html` from
+  `MCP_SANDBOX_ORIGIN` and verifies required response
+  headers (`frame-ancestors`, `Cache-Control`,
+  `Cross-Origin-Resource-Policy`); refuses to enable
+  Apps capability advertisement on missing/incorrect
+  headers; logs the missing field for operators.
+
+**Required text fallback contract (active, v13):**
+
+- The single fallback card UI (built from `toolInfo` and
+  `CallToolResult.content`) replaces the legacy
+  `UIResourceRenderer` on non-chat surfaces, failed relay
+  probes, unsupported browsers, and bootstrap health
+  failures. When the server's `content` is empty or
+  trivial, the card surfaces a generic "App is unavailable
+  on this surface" message rather than synthesizing
+  content.
+
+**Vendored Apps + Tasks schemas (v11 + v13 extension):**
+
+- Vendor generated TypeScript types and JSON Schemas for
+  Apps stable `2026-01-26` into
+  `packages/data-provider/src/mcp-apps/schemas/` (v11
+  baseline).
+- Vendor generated TypeScript types and JSON Schemas for
+  Tasks experimental `2025-11-25` into
+  `packages/data-provider/src/mcp-tasks/schemas/` (v13).
+- Both updated only via reviewed PRs; package upgrades
+  are independent of schema updates.
 
 Phase 1 exit criteria:
 
@@ -2073,9 +2376,10 @@ Phase 1 exit criteria:
 7. Self-contained-HTML validator rejects every external-asset
    construct in the test corpus (live behind a flag, not yet
    used in the Preview render path).
-8. `authContextHash` unit tests pass, including the
-   OAuth-refresh invariance test **and** the non-auth-edit
-   invariance test (v12).
+8. `authContextHash` unit tests pass against fixture
+   configs: OAuth-refresh invariance, cosmetic-edit
+   invariance, and auth-relevant-edit sensitivity (v13
+   derived snapshot).
 9. **Construction-order invariant** is enforced and tested
    in CI for both the outer host → proxy and proxy → inner
    iframe orderings; a fixture flipping the order
@@ -2101,14 +2405,57 @@ Phase 1 exit criteria:
     namespace preserved intact. A regression test fails if
     the inherited bridge drops `_meta` (this is a known
     upstream regression in basic Apps hosts).
+13. **Bootstrap trust health check (v13)** runs at Apps
+    capability boot: the host fetches `proxy.html` from
+    `MCP_SANDBOX_ORIGIN` and verifies that the response
+    carries `Content-Security-Policy: frame-ancestors
+    <librechat-origin>`, `Cache-Control: no-cache` (or
+    equivalent), and `Cross-Origin-Resource-Policy:
+    same-site` (or stricter). Any missing required header
+    refuses to enable Apps capability advertisement and
+    logs the missing field for operators.
+14. **Sandbox proxy fail-closed bootstrap (v13)**: the
+    proxy never falls back to `document.referrer` for
+    parent-origin discovery, never sends or accepts `*` as
+    `targetOrigin`, and refuses to initialize if the
+    `host-bootstrap` postMessage from the LibreChat
+    application origin is absent within
+    `MCP_APPS_INITIALIZE_TIMEOUT_MS` or arrives from any
+    other origin. Tests assert this on Chromium, Firefox,
+    and WebKit/Safari.
+15. **Required text fallback (v13)**: when an app-launching
+    tool returns empty or trivial `content`, the host
+    renders a single generic "App is unavailable on this
+    surface" card built from `toolInfo` rather than
+    synthesizing content. The test fixture is a server
+    that explicitly returns empty `content` plus a
+    `_meta.ui.resourceUri`; the assertion is that the card
+    renders identically across non-chat surfaces, failed
+    relay probes, unsupported browsers, and bootstrap
+    health-check failures.
+16. **Exactly-one-match `contents[]` selection (v13)**:
+    a fixture server that returns two `contents[]` entries
+    matching the same declared `(uri, mimeType)` triggers
+    a review-time error; a fixture with one match plus
+    several non-matching companion entries succeeds and
+    logs the extras at info level.
 
-### Phase 2P — Apps Preview release (≈1–2 weeks)
+### Phase 2P — Apps Preview release (≈1–1.5 weeks)
 
 End of phase: Apps capability advertised when
-`MCP_APPS_MODE="preview"`; live-chat-only Apps render
-inline (and optionally fullscreen behind operator gate); legacy
-renderer still serves share/search/plugin surfaces; the
-hardening delta is **not yet** active.
+`MCP_APPS_MODE="preview"`; live-chat-only Apps render inline
+(and optionally fullscreen behind operator gate) under the
+**unified authoring profile** (self-contained HTML, no
+external assets, `connect-src 'none'`); Wasm/eval permitted
+in Preview's CSP; legacy renderer still serves
+share/search/plugin surfaces; manifestHash review and full
+legacy retirement remain Hardened-only.
+
+(v13 estimate is shorter than v12 because the asset
+validator and `connect-src 'none'` policy moved into Phase 1
+with the unified authoring profile; Phase 2P now does the
+visibility/HostContext/rate-limit work and turns on
+capability advertisement.)
 
 - Live-chat path adopts upstream PR #11799's
   `MCPAppContainer`, `MCPAppBridge`, and backend proxies as
@@ -2289,11 +2636,16 @@ for implemented directions.
     automatic `tasks/result`. No API-process background
     poller. Opening the jobs panel never eagerly fetches
     `tasks/result` for terminal rows.
-  - **Single-path "wait for result."** When the user enters a
-    blocking wait, the host suspends the shared poller's
-    `tasks/get` for that task and relies on a single
-    `tasks/result` call. Polling resumes only on call
-    failure, user-cancelled wait, or navigation away.
+  - **"Wait for result" is a UI mode on top of the shared
+    poller (v13).** When the user clicks "wait for
+    result" on an in-flight task, the UI switches to a
+    waiting state and the shared poller keeps running.
+    On the first terminal status the host issues exactly
+    **one** `tasks/result` to fetch the envelope. There
+    is no blocking-waiter, no concurrent wait/poll
+    duality, and no dedicated wait-restart state machine
+    on session loss — re-init during polling uses the
+    standard outstanding-task revalidation path.
   - **Subscriber registry is in-memory per connected session.**
     On reconnect, subscribers re-register and reload from
     `tasks/get` via the shared poller. No durable subscriber
@@ -2361,24 +2713,25 @@ for implemented directions.
     server advertises the `tasks.list` sub-capability, per
     decision 29). Tasks created under a prior auth-relevant
     configuration become invisible (and unfetchable) when
-    that configuration changes (`authRevision` bump, OAuth
-    subject change, credential rotation).
+    any field of the v13 derived `authConfigSnapshot`
+    changes (server URL, transport type, OAuth issuer/
+    client_id/scopes, API key reference, credential
+    mapping policy), or when the user's identity changes,
+    or when `oauthSubject` or `apiKeyFingerprint` rotates.
   - **Streamable HTTP only.** Persist `MCP-Session-Id` per task.
     HTTP 404 → start a new MCP session, **revalidate
     outstanding `taskId`s via `tasks/get`** (this work moved
     from Phase 0 to here in v7 because it is Tasks-specific).
     Treat "task not found" as terminal-with-error.
-  - **Wait-restart on session loss (v12).** A blocking
-    `tasks/result` wait that fails with a 404 / session-lost
-    error triggers exactly **one** re-init + revalidate +
-    retry budget per decision 30. After re-init, the host
-    issues `tasks/get` once on the new session, then either
-    issues a single `tasks/result` retry (non-terminal),
-    forwards the terminal envelope (terminal), or marks
-    the task terminal-with-error and surfaces "task lost
-    across re-init" (not found). A second `tasks/result`
-    failure is surfaced; the host does not retry further
-    and does not silently fall back to polling.
+  - **Session loss during polling (v13).** Because v13
+    has no blocking-waiter, session loss during the
+    "wait for result" UI state is the same case as
+    session loss during normal polling: the host
+    re-initializes, runs the standard outstanding-task
+    `tasks/get` revalidation against the new session, and
+    resumes polling. There is no dedicated re-init/retry
+    budget for waits and no risk of duplicate concurrent
+    waiters.
   - **Capability-conditional Tasks UX (v12).** The host
     persists negotiated `tasks.list` / `tasks.cancel`
     capabilities on `MCPTask` and on the in-process
@@ -2397,15 +2750,22 @@ for implemented directions.
 - `progressToken` correlated by the related-task meta and routed
   through the bridge to active subscribers. **No durable
   subscriber registry**; subscribers are session-scoped.
-- **`model-immediate-response` runtime**:
-  - When present, agent emits an intermediate assistant-visible
-    message containing the server-supplied string, clearly marked
-    as a preliminary placeholder.
-  - Model is suppressed from speaking its own placeholder for the
-    same call.
-  - Final task result appended as a separate message; placeholder
-    never overwritten.
-  - When absent, agent uses a neutral default.
+- **`model-immediate-response` runtime (v13: model plumbing
+  only)**:
+  - When present, the agent passes the server-supplied
+    string into the model context as the immediate tool
+    result for the in-flight task call. This matches the
+    spec's narrow scope for the provisional metadata
+    field.
+  - The host does **not** emit an assistant-visible
+    placeholder message, does **not** suppress the model
+    for the turn, and does **not** stage a separate
+    "final result" message that overwrites a placeholder.
+  - When absent, the model receives a neutral
+    "task-in-progress" string that the agent loop owns.
+  - Users see standard task-card chrome in the
+    running-jobs UI; final results render via the same
+    task-card flow when the task terminates.
 - Frontend running-jobs surface in
   `client/src/components/SidePanel/`: cursor-paginated, status
   badges, **status-only by default** (no progress bars in
@@ -2451,8 +2811,10 @@ The app is **one predeclared `ui://cad-app` resource** linked from a
 single `cad.workbench` tool. The same view persists for the entire
 session and refreshes itself by calling other CAD-server tools as
 the user navigates. This walkthrough assumes
-`MCP_APPS_MODE="hardened"`; the Preview path is similar but uses
-the upstream CSP and the upstream `data:`-URL outer iframe.
+`MCP_APPS_MODE="hardened"`. The Preview path is identical except
+that the inner CSP permits Wasm and `eval` and (when
+`appSettings.allowFullscreen`) fullscreen is offered; the
+authoring profile is the same in both modes (v13).
 
 The B-Rep kernel **runs server-side** in this design. The
 browser receives only pre-tessellated GLTF + face IDs as
@@ -2517,8 +2879,11 @@ to instantiate.
 5. The view calls `cad.submit_job(...)`
    (`taskSupport: required`, ~30 min). Server returns a task
    handle plus a `model-immediate-response` like "Job submitted,
-   ID 12345 — results in ~30 minutes". Agent emits that as a
-   placeholder; model suppressed for this turn.
+   ID 12345 — results in ~30 minutes". The agent feeds that
+   string into the model as the immediate tool result for the
+   call (v13 — model plumbing only); the user sees a standard
+   task card in the running-jobs UI, not a separate assistant
+   placeholder turn.
 6. The view transitions to a "job status" panel — same `ui://`
    resource. While mounted, the panel polls. After the user
    closes the chat, polling stops; the task continues
@@ -2530,21 +2895,28 @@ to instantiate.
    by `authContextHash`). The panel is status-only and does
    not eagerly call `tasks/result`. The task row shows
    `completed` and a TTL countdown. The user clicks "open
-   detail" (single-path wait), at which point the host
-   suspends `tasks/get` for that task and issues one
-   **live** `tasks/result` against the server (v12 — the
-   host does not cache and does not rehydrate). The
-   envelope's structured content carries an **artifact
-   handle** (`{ artifactId, objectKey }`), not a presigned
-   URL — presigned URLs are time-limited and would already
-   be dead. If the user had returned past `createdAt + ttl`,
-   the server may legitimately answer "task expired" and
-   the user sees a clear notice instead of stale data.
-   When the user clicks Download, the view calls a
-   `cad.get_download_url(artifactId)` MCP tool that mints a
-   fresh short-TTL presigned URL; the view then opens it
-   via `ui/open-link` against the host navigation
+   detail", at which point the host issues one **live**
+   `tasks/result` against the server (v12/v13 — no cache,
+   no rehydration). The envelope's structured content
+   carries an **artifact handle** (`{ artifactId,
+   objectKey }`), not a presigned URL — presigned URLs are
+   time-limited and would already be dead. If the user had
+   returned past `createdAt + ttl`, the server may
+   legitimately answer "task expired" and the user sees a
+   clear notice instead of stale data. When the user
+   clicks Download, the view calls a
+   `cad.get_download_url(artifactId)` MCP tool that mints
+   a fresh short-TTL presigned URL; the view then opens
+   it via `ui/open-link` against the host navigation
    allowlist.
+
+   If the user had clicked "wait for result" while the
+   task was still in-flight, the v13 path is: the UI
+   shows a waiting state, the shared `tasks/get` poller
+   keeps running, and on the first terminal status the
+   host issues exactly one `tasks/result` to fetch the
+   envelope — no blocking-waiter, no concurrent
+   wait/poll.
 
 ## Risks / open questions
 
@@ -2565,35 +2937,28 @@ to instantiate.
   both flags off and rely on the deny-default legacy
   renderer.
 - **Self-contained-HTML rule is a real constraint on app
-  authors (Hardened GA only).** Hardened GA forbids remote
-  scripts, styles, fonts, and images; Preview honors
-  absolute HTTPS URLs in upstream `resourceDomains`.
-  Operator docs explain the difference so app authors do
-  not ship a Preview-only bundle and discover at Hardened
-  GA cutover that it is rejected.
-- **Relative external URLs are rejected in both modes
-  (v12).** Even Preview rejects relative `<script src>` /
-  `<link href>` / `<img src>` / frame `src` because under
-  the unified `srcdoc` topology these resolve against
-  `MCP_SANDBOX_ORIGIN` rather than against `ui://`. App
-  authors using build tooling that emits relative URLs
-  must either inline assets or rewrite to absolute HTTPS
-  URLs covered by `resourceDomains`.
-- **Direct browser networking in Preview is best-effort
-  (v12).** Hardened GA cuts in-app `fetch` / XHR /
-  WebSocket entirely. Preview honors upstream
-  `connectDomains`, but the unified `srcdoc` topology
-  forces an opaque-origin (`null`) inner frame, which
-  breaks cookies, conservative CORS, OAuth, and
-  origin-based API allowlists. Apps that depend on
-  credentialed direct browser networking will keep working
-  for anonymous public APIs and break for everything else.
-  Operator docs label Preview as a non-portable authoring
-  mode and recommend bridge-routed access
-  (`tools/call` / `resources/read` / `ui/open-link`) for
-  any app intended to ship in production. Re-introducing
-  reliable `connect-src` is post-Hardened-GA and depends
-  on a stable-origin design.
+  authors (both modes, v13).** Both Preview and Hardened
+  forbid external scripts, styles, fonts, images, and
+  frames; both block direct browser networking. App
+  authors target one profile and ship inline-bundled
+  assets. The trade is loss of supply-chain attack surface
+  and a clean migration path between modes.
+- **No direct browser networking in either mode (v13).**
+  v1 cuts in-app `fetch` / XHR / WebSocket from view JS in
+  both Preview and Hardened. The bridge (`tools/call` /
+  `resources/read` / `ui/open-link`) is the only network
+  path. Apps that depend on credentialed direct browser
+  networking expose those calls as MCP tools on their own
+  server. Re-introducing reliable `connect-src` is
+  post-v1 and depends on a stable-origin design.
+- **`model-immediate-response` is model plumbing only
+  (v13).** The provisional metadata field is fed into the
+  model's tool-result context as the spec narrowly
+  envisions; v1 does not turn it into an assistant-visible
+  placeholder turn or apply any agent-loop suppression
+  rules. UX risk: server authors who expected a
+  user-visible "your job is queued" assistant message
+  will not see one. Operator docs explain the contract.
 - **Approval is over a manifest, not just bytes.** Hash
   divergence catches policy drift (sandbox, permissions,
   network policy, URI, trust-policy version), not just byte
@@ -2664,17 +3029,17 @@ to instantiate.
   TTL the server may legitimately respond "task expired"
   and the host surfaces that without inventing a fallback.
 - **`authContextHash` invalidation can hide tasks.** If a user
-  rotates credentials or an operator changes
-  **auth-relevant** server config (URL, transport, OAuth
-  issuer/client/scopes, API key reference, credential
-  mapping policy), tasks created under the prior context
-  become invisible by design. v12 narrows the trigger from
-  any config edit (v11's `configRevision`) to auth-relevant
-  config edits only (v12's `authRevision`), so cosmetic
-  edits no longer orphan tasks. The UI must still explain
-  the invalidation rather than show an empty list as if no
-  tasks exist; otherwise the user thinks the system
-  silently dropped their work.
+  rotates credentials or an operator changes any
+  **auth-relevant** snapshot field (server URL, transport
+  type, OAuth issuer/client/scopes, API key reference,
+  credential mapping policy), tasks created under the prior
+  context become invisible by design. v13's derived snapshot
+  replaces v12's `authRevision` counter so the trigger is
+  structural rather than procedural; cosmetic edits cannot
+  orphan tasks. The UI must still explain the invalidation
+  rather than show an empty list as if no tasks exist;
+  otherwise the user thinks the system silently dropped
+  their work.
 - **Tasks UX is capability-conditional.** v12 does not
   promise a global jobs panel against servers that do not
   advertise `tasks.list`, and does not render cancel
@@ -2684,6 +3049,27 @@ to instantiate.
   per-conversation handles view as such so users do not
   expect cross-session recovery on capability-limited
   servers.
+- **No blocking `tasks/result` waiter in v1 (v13).**
+  "Wait for result" is implemented on top of the shared
+  poller; the host issues `tasks/result` once on the first
+  terminal status. Latency cost: at most one
+  `pollInterval` of additional completion delay. Code cost
+  saved: an entire wait-restart state machine and the
+  concurrent wait/poll edges that come with it. If a
+  future use case demands sub-`pollInterval` wait latency,
+  a blocking waiter can be added behind a flag with its
+  own restart contract.
+- **`authContextHash` is now a derived snapshot (v13).**
+  The ownership invariant is structural — auth-relevant
+  config edits change the hash; cosmetic edits do not.
+  Risk: the snapshot's "what counts as auth-relevant" rule
+  is set at one place (`packages/data-schemas`); a
+  schema change that adds a new auth-relevant field
+  without updating the snapshot definition could leak
+  cross-context access until the schema is updated. The
+  unit-test corpus tests for sensitivity to each field
+  individually so adding a field without updating the
+  snapshot definition fails CI.
 - **Remount is not state preservation.** The extended
   `mcp_app` artifact guarantees the view re-renders against
   the same approved bytes. It does **not** preserve internal
@@ -2735,12 +3121,16 @@ the cross-origin iframe layer.
 - HTTP 404 → new MCP session (basic). Outstanding-task
   revalidation is **Phase 4**.
 - Per-user token scoping for shared server definitions.
-- `authContextHash` computed at connection time over normalized
-  effective auth-relevant configuration; immutable across the
-  connection's lifetime; auth-relevant changes invalidate task
-  ownership; **OAuth refresh does not change the hash**;
-  **non-auth config edits (display name, docs, fallback
-  height) do not change the hash** (v12 `authRevision`).
+- `authContextHash` computed at connection time over the v13
+  derived `authConfigSnapshot` plus identity inputs;
+  immutable across the connection's lifetime; auth-relevant
+  changes invalidate task ownership; **OAuth refresh does
+  not change the hash**; **cosmetic config edits (display
+  name, description, icon, docs, default UI settings,
+  fallback height) do not change the hash**;
+  **auth-relevant edits (server URL, transport type,
+  OAuth issuer/client/scopes, API key reference,
+  credential mapping policy) do change the hash**.
 - (Regression-only) 307/308 redirect handling and credential
   stripping on cross-origin redirects: spot-check that public
   `main` behavior has not regressed.
@@ -2794,22 +3184,17 @@ are listed twice.
 - **Iframe sandbox flag filter**: requested `allow-popups`,
   `allow-top-navigation`, `allow-forms`, `allow-same-origin`
   stripped at host before render.
-- **[H] Self-contained-HTML validator (Hardened)**: HTML
-  containing **any** `<script src>` (relative or absolute),
-  `<link href>`, `<img src>` to a non-`data:` URL,
-  `<iframe src>`, `<object>`/`<embed>`, remote
-  `<source>`/`<track>`/`<video>`/`<audio>` URL, `<base>`, or
-  remote ES `import`/dynamic `import()` is rejected at review
-  time. Inline `<script>` and `<style>` are accepted; `data:`
-  images are accepted.
-- **[P] Relative-external-URL rejection (Preview, v12)**:
-  HTML containing relative `<script src>`, `<link href>`,
-  `<img src>`, frame `src`, or `<base>` is rejected at
-  review time even in Preview, because under the unified
-  `srcdoc` topology relative URLs would resolve against
-  `MCP_SANDBOX_ORIGIN`. Absolute HTTPS URLs covered by
-  `_meta.ui.csp.resourceDomains` are still accepted in
-  Preview.
+- **[A] Self-contained-HTML validator (both modes, v13)**:
+  HTML containing **any** `<script src>` (relative or
+  absolute), `<link href>`, `<img src>` to a non-`data:`
+  URL, `<iframe src>`, `<object>`/`<embed>`, remote
+  `<source>`/`<track>`/`<video>`/`<audio>` URL, or
+  `<base>` is rejected at review time in both Preview
+  and Hardened. Inline `<script>` and `<style>` are
+  accepted; `data:` images are accepted. The validator
+  does **not** statically analyze inline JS for dynamic
+  imports, `fetch`, `eval`, or `WebAssembly.instantiate`;
+  those are runtime CSP concerns (v13 simplification).
 - **One proxy iframe per app instance**: a conversation with N
   app messages renders N proxy iframes, not one shared proxy.
   Teardown of one instance does not affect siblings.
@@ -2835,30 +3220,27 @@ are listed twice.
   rejected with a clear error; consent prompt in host chrome.
 - **`displayMode` / `availableDisplayModes` in `HostContext`**.
 - **`toolInfo`** populated in `HostContext`.
-- **[H] CSP `connect-src 'none'` enforcement**: any in-app
-  `fetch` / XHR / WebSocket attempt is blocked by the
-  browser. The view must route network access via
-  `tools/call`, `resources/read`, or `ui/open-link`. Test
-  asserts that even a server explicitly setting
-  `connectDomains` does **not** install any `connect-src`
-  origin in the rendered CSP (the field is parsed but
-  ignored in Hardened).
-- **[P]** In Preview, `connectDomains` IS honored in the
-  rendered CSP per upstream; an explicit fixture asserts
-  that the upstream `applyAppSettingsToResult` path is
-  exercised and `connect-src` lists the configured
-  origins. The Preview-vs-Hardened test matrix makes the
-  difference visible.
-- **[H] Wasm exclusion**: a fixture page that calls
-  `WebAssembly.instantiate(...)` is rejected by the CSP at
-  runtime (`script-src 'unsafe-inline'` without
+- **[A] CSP `connect-src 'none'` enforcement (both modes,
+  v13)**: any in-app `fetch` / XHR / WebSocket attempt is
+  blocked by the browser. The view must route network
+  access via `tools/call`, `resources/read`, or
+  `ui/open-link`. Test asserts that even a server
+  explicitly setting `connectDomains` does **not** install
+  any `connect-src` origin in the rendered CSP — the
+  field is parsed but ignored in both modes.
+- **[H] Wasm exclusion (Hardened)**: a fixture page that
+  calls `WebAssembly.instantiate(...)` is rejected by the
+  CSP at runtime (`script-src 'unsafe-inline'` without
   `wasm-unsafe-eval`). The host logs the violation; the
   view sees the failure and can degrade gracefully.
-- **[H] `eval` exclusion**: a fixture page that calls
-  `eval('1+1')` or `new Function('return 1+1')()` is
-  rejected by the CSP at runtime (no `'unsafe-eval'`).
-- **[P]** In Preview, both Wasm and `eval` work because the
-  upstream CSP allows them. A fixture asserts the contrast.
+- **[H] `eval` exclusion (Hardened)**: a fixture page
+  that calls `eval('1+1')` or `new Function('return 1+1')()`
+  is rejected by the CSP at runtime (no `'unsafe-eval'`).
+- **[P] Wasm and `eval` permitted (Preview)**: the same
+  fixtures succeed in Preview because the Preview inner
+  CSP adds `wasm-unsafe-eval` and `'unsafe-eval'` to
+  `script-src`. The Preview-vs-Hardened test matrix
+  makes the difference visible.
 - `<meta>`-CSP limitations exercised (no `sandbox`, no
   `frame-ancestors`, no `report-uri`).
 - `ui/open-link` gated by navigation allowlist, separate
@@ -2917,9 +3299,46 @@ are listed twice.
 - **Content decoding**: `text` and `blob` payloads both
   succeed; oversize `blob` rejected; non-`text/html;profile
   =mcp-app` MIME falls back to text. Multi-content
-  `resources/read` responses are accepted: the host picks
-  the matching `(uri, mimeType)` `contents[]` entry, logs
-  extras, and proceeds.
+  `resources/read` responses are accepted: the host
+  requires **exactly one** matching `(uri, mimeType)`
+  `contents[]` entry (v13). Zero matches errors; **two
+  or more matches errors**; non-matching siblings are
+  logged at info level and ignored.
+- **[A] Exactly-one-match `contents[]` rule (v13)**: a
+  fixture server that returns two `contents[]` entries
+  with the same declared `(uri, mimeType)` triggers a
+  review-time error with a clear "duplicate matching
+  HTML entry" message. A fixture with one match plus
+  several non-matching companion entries succeeds.
+- **[A] Bootstrap trust health check (v13)**: at boot,
+  the host fetches `proxy.html` from
+  `MCP_SANDBOX_ORIGIN` and refuses to enable Apps
+  capability advertisement when any of the required
+  response headers (`frame-ancestors`,
+  `Cross-Origin-Resource-Policy`, no-cache
+  `Cache-Control`) is missing. Tests cover each missing
+  header and assert the failure mode.
+- **[A] Sandbox proxy fail-closed bootstrap (v13)**: the
+  proxy refuses to initialize when the `host-bootstrap`
+  postMessage is absent within
+  `MCP_APPS_INITIALIZE_TIMEOUT_MS`, when it arrives from
+  any origin other than the configured LibreChat
+  application origin, and when its payload is malformed.
+  Tests assert this on Chromium, Firefox, and
+  WebKit/Safari. A fixture deliberately attempts to use
+  `document.referrer` as the host origin and verifies
+  the proxy does not consume it.
+- **[A] Required text fallback (v13)**: a server that
+  returns empty `content` plus a `_meta.ui.resourceUri`
+  causes the host to render the generic "App is
+  unavailable on this surface" card built from
+  `toolInfo`. The card renders identically across:
+  - non-chat surfaces (share, search, plugin),
+  - failed `ui/initialize` relay probes,
+  - browsers that fail the runtime relay self-test,
+  - bootstrap trust health-check failures.
+  Hardened additionally renders the same card when the
+  manifest fails review or hash pinning refuses.
 - **Manifest hash determinism**: shuffling JSON key order
   in any manifest field yields an identical
   `manifestHash`; modifying any covered field changes it.
@@ -3018,10 +3437,17 @@ are listed twice.
 - **Detail entry triggers `tasks/result`**: opening a terminal
   task's detail row, or clicking "wait for result" on an
   in-flight task, calls `tasks/result` exactly once.
-- **Single-path wait**: entering "wait for result" on an
-  in-flight task **suspends `tasks/get` polling for that
-  task**; only `tasks/result` is in flight. Polling resumes
-  on call failure, user cancel, or navigation away.
+- **Poller-based wait UI (v13)**: clicking "wait for
+  result" on an in-flight task does **not** issue a
+  blocking `tasks/result` and does **not** suspend the
+  shared poller. The UI switches to a waiting state; the
+  shared poller continues at `pollInterval`; on the
+  first terminal status the host issues exactly **one**
+  `tasks/result` and resolves the wait. A test asserts
+  no blocking `tasks/result` is in flight while the wait
+  is active and that the terminal-trigger fetch happens
+  exactly once. Latency: at most one `pollInterval` of
+  additional completion delay.
 - **No opportunistic save**: a subscribed task that
   transitions to terminal while the user is present does
   **not** trigger any `tasks/result`; the test asserts no
@@ -3043,47 +3469,57 @@ are listed twice.
   **outstanding-task revalidation** runs (Phase 4 work, not
   Phase 0): each known `taskId` is queried via `tasks/get` on
   the new session; "not found" becomes terminal-with-error.
-- **Wait-restart on session loss (v12)**: a blocking
-  `tasks/result` wait that fails with 404 / session-lost
-  triggers exactly **one** re-init + `tasks/get` + retry
-  cycle. Test cases:
-  - Non-terminal after re-init: one `tasks/get` then one
-    `tasks/result` retry; wait resumes.
-  - Terminal after re-init: one `tasks/get` then one
-    `tasks/result` that returns the terminal envelope.
-  - "Not found" after re-init: marked terminal-with-error
-    with a clear "task lost across re-init" message; no
-    retry.
-  - Second `tasks/result` failure: surfaced as failure;
-    no further retry, no silent fallback to polling, no
-    duplicate concurrent waiter.
+- **Session loss during polling (v13, generalized from
+  the cut wait-restart path)**: HTTP 404 on `tasks/get`
+  triggers re-init and the standard outstanding-task
+  revalidation; "not found" becomes terminal-with-error;
+  the poller resumes against the new session. Because
+  v13 has no blocking-waiter, the same test covers the
+  "wait for result" UI state — no separate wait-restart
+  state machine is required or asserted.
 - `progressToken` propagates through bridge to active subscribers
   via in-memory mapping.
-- `model-immediate-response`: emitted as intermediate message;
-  model suppressed; final result appended without overwriting.
-- **`authContextHash` binding**: `tasks/list` from a
-  different context returns empty; `tasks/get` for another
-  context's task returns not-found. A test deliberately
-  mutates the underlying **auth-relevant** configuration
-  mid-flight (e.g. operator bumps `authRevision` because
-  the OAuth issuer changed) and verifies the hash changes
-  and prior tasks become invisible (with a UI message
-  explaining the binding).
+- `model-immediate-response` (v13: model plumbing only):
+  the agent passes the server-supplied string into the
+  model context as the immediate tool result for the
+  in-flight task call. Tests assert: (a) the string
+  reaches the model; (b) **no** assistant-visible
+  placeholder turn is emitted; (c) the model is **not**
+  suppressed for the same call; (d) the final task
+  result renders as a normal task card, not as an
+  overwrite of a placeholder turn.
+- **`authContextHash` binding (v13 derived snapshot)**:
+  `tasks/list` from a different context returns empty;
+  `tasks/get` for another context's task returns
+  not-found. A test mutates an **auth-relevant** field of
+  the v13 `authConfigSnapshot` mid-flight (e.g. operator
+  changes the server URL or rotates the OAuth client_id)
+  and verifies the hash changes and prior tasks become
+  invisible.
 - **`authContextHash` OAuth-refresh invariance**: a test
   refreshes the OAuth access token mid-flight (without
   changing `oauthSubject` or any other identity field) and
-  verifies `authContextHash` is unchanged and the in-flight
-  task is still visible / fetchable. This is the v11
+  verifies `authContextHash` is unchanged and the
+  in-flight task is still visible / fetchable. (v11
   regression guard against the v10 shape that included
-  live bearer-token bytes.
-- **`authContextHash` non-auth-edit invariance (v12)**: a
-  test mutates non-auth server config (display name,
+  live bearer-token bytes.)
+- **`authContextHash` cosmetic-edit invariance (v13)**:
+  a test mutates cosmetic server config (display name,
   description, icon, docs, default UI settings, fallback
-  height) without bumping `authRevision` and verifies
-  `authContextHash` is unchanged and prior tasks remain
-  visible / fetchable. This is the v12 regression guard
-  against the v11 `configRevision` shape that bumped on
-  every server-config edit.
+  height) and verifies `authContextHash` is unchanged
+  and prior tasks remain visible / fetchable. v13's
+  derived snapshot replaces v11's `configRevision`
+  counter and v12's `authRevision` counter, so this
+  test now asserts a **structural** invariant rather
+  than a procedural one.
+- **`authContextHash` per-field auth-relevance (v13)**:
+  one test per snapshot field (server URL, transport
+  type, OAuth issuer, OAuth client_id, OAuth scopes,
+  API key reference, credential mapping policy) flips
+  exactly that field and asserts the hash changes. A
+  schema change that adds a new auth-relevant field
+  without updating the snapshot definition fails the
+  per-field test.
 - **Shared in-process poller dedup**: with N subscribers
   on the same `(taskId, authContextHash)` in one process,
   exactly one outbound `tasks/get` is observed per
@@ -3119,11 +3555,11 @@ substrate.
 | Phase | Estimate |
 |---|---|
 | 0 — Transport reliability + auth-context (inherits `dev` fixes) | 2–4 days |
-| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology to `MCP_SANDBOX_ORIGIN` for both modes, hop-specific relay + proxy-stamped nonce + folded `ui/initialize` probe (Preview gate, v12), `_meta` passthrough verification (Preview gate, v12), vendor schemas, lazy bridge with budget, Hardened delta scaffolds, default-deny legacy renderer, live-chat narrowing, lazy remount | 2–2.5 weeks (v12 absorbs relay validation work from former Phase 2H) |
-| 2P — Apps Preview release (single-ACL refactor, truthful HostContext minimum subset, fullscreen gate, payload truncation, rate limits, capability turn-on) | 1–2 weeks |
-| 2H — Apps Hardened (policy-only delta on Phase 1's topology and relay validation: manifest review, `mcp_app` artifact extension, full legacy retirement, `connect-src 'none'`, Wasm/eval exclusion, no fullscreen) | 1.5–2 weeks (separate release; v12 — relay work moved to Phase 1) |
+| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology, **single authoring profile (v13)**, hop-specific relay + proxy-stamped nonce + folded init probe + `_meta` passthrough (Preview gate), bootstrap trust health check (v13), required text fallback (v13), exactly-one-match `contents[]` (v13), vendor Apps + Tasks schemas, lazy bridge with budget, Hardened scaffolds (manifest review, hash, artifact extension), default-deny legacy renderer, live-chat narrowing, lazy remount | 2.5–3 weeks (v13 absorbs validator + CSP enforcement into Phase 1 to support the unified profile) |
+| 2P — Apps Preview release (single-ACL refactor, truthful HostContext minimum subset, fullscreen gate, payload truncation, rate limits, capability turn-on) | 1–1.5 weeks (v13: shorter — validator and CSP enforcement landed in Phase 1) |
+| 2H — Apps Hardened (policy-only delta: manifest review activation, `mcp_app` artifact extension write-through, full legacy retirement, Hardened CSP variant without Wasm/eval, no fullscreen) | 1.5 weeks (separate release; v13 — relay + asset enforcement landed in Phase 1) |
 | 3 — `tool-input-partial` (optional) | 1 week (risk) |
-| 4 — MCP Tasks v1 (capability-conditional status-only jobs panel; metadata-only storage with live `tasks/result`; wait-restart on session loss; progress UI deferred to #12535 reuse) | ~2 weeks |
+| 4 — MCP Tasks v1 (capability-conditional status-only jobs panel; metadata-only storage with live `tasks/result`; **poller-based wait UI (v13: no blocking waiter)**; `model-immediate-response` as model plumbing; progress UI deferred to #12535 reuse) | 1.5–2 weeks (v13: shorter — wait-restart machine cut) |
 | 5 — Hardening + browser matrix + ops docs | 1 week |
 
 **Sequential release order: Apps Preview → Tasks v1 → Apps
@@ -3134,9 +3570,9 @@ user-visible synergy. Three releases is cleaner.
 
 | Release | Phases | Estimate (sequential) |
 |---|---|---|
-| **R1: Apps Preview (chat)** | 0 + 1 + 2P | **~3.5–4.5 weeks** (v12; Phase 1 absorbs relay validation) |
-| **R2: Tasks v1 (capability-conditional status-first jobs panel; cancel where supported; live detail fetch)** | 4 | **~2 weeks** after R1 |
-| **R3: Apps Hardened** (LibreChat Hardened App Profile) | 2H | **~1.5–2 weeks** after R2 (v12; relay work moved up) |
+| **R1: Apps Preview (chat)** | 0 + 1 + 2P | **~4–5 weeks** (v13; Phase 1 absorbs the unified authoring profile) |
+| **R2: Tasks v1 (capability-conditional status-first jobs panel; cancel where supported; poller-based wait UI; live detail fetch)** | 4 | **~1.5–2 weeks** after R1 |
+| **R3: Apps Hardened** (LibreChat Hardened App Profile) | 2H | **~1.5 weeks** after R2 (v13; Hardened delta is policy-only) |
 
 If staffing allows independent tracks, Tasks (R2) can run in
 parallel with R1 because the only shared touchpoint is

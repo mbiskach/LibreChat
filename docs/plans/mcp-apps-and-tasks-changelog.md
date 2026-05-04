@@ -3,7 +3,7 @@
 This file is **revision history**, not implementation guidance.
 The current plan is in [`mcp-apps-and-tasks.md`](./mcp-apps-and-tasks.md).
 
-The plan went through twelve revisions during scoping and
+The plan went through thirteen revisions during scoping and
 review, each in response to a specific gap or contradiction
 caught in review. Implementers should read the plan; this
 file is for reviewers, future maintainers, and anyone trying
@@ -20,9 +20,157 @@ to understand why a particular decision is the way it is.
 | v10 | Decisions frozen | Single `MCP_APPS_MODE` enum; chat-only surface matrix; Hardened as LibreChat profile; Wasm/eval excluded in Hardened; drop separate `MCPAppInstance`; shared fan-out Tasks poller |
 | v11 | Reality check | Unified outer-sandbox topology; #11799 is a local patchset; stable-identity `authContextHash`; lazy remount; multi-content `resources/read` accepted; vendor generated schemas |
 | v12 | Implementation prep | Preview compatibility clause; relay validation promoted to Phase 1; `_meta` passthrough as Preview gate; capability-conditional Tasks UX; `authRevision` replaces `configRevision`; host-side terminal-result cache cut entirely; auto-repin advisory pinning; deterministic wait-restart on session loss |
+| v13 | Delete the compatibility theater | One authoring profile across modes (no external assets, `connect-src 'none'` in both); blocking `tasks/result` waiter cut entirely (poller-based wait UI); `authContextHash` derives from a snapshot, not a counter; bootstrap trust is fail-closed; exactly-one-match `contents[]` rule; required text fallback contract; `model-immediate-response` is model plumbing only; vendor Tasks schemas; validator drops static JS inspection |
 
 Full per-revision narratives below; full earlier-revision
 narratives (v1–v5) are available in git history.
+
+---
+
+## v13 — Delete the compatibility theater
+
+A second external review observed that v12 still carried two
+expensive structures that the chosen architecture had already
+made unnecessary, plus several places where security-sensitive
+implementation details had been left implicit. v13 deletes the
+compatibility theater (Preview as a "looser" stable Apps mode
+with its own asset / networking story, and a dedicated blocking
+`tasks/result` waiter with its own restart state machine), and
+makes the implicit security details explicit (bootstrap trust,
+exactly-one-match selection, required text fallback). v12's
+frozen decisions remain in force; v13 only adjusts where the
+review found leftover complexity worth cutting.
+
+**v13 decisions (binding; supersede v12 where they conflict):**
+
+- **Single authoring profile across modes.** Once Phase 1
+  unifies Preview and Hardened onto `srcdoc` under
+  `MCP_SANDBOX_ORIGIN`, treating Preview as a partial,
+  upstream-honoring asset / networking story is a
+  net-negative. v13 collapses the modes onto one authoring
+  profile: self-contained HTML in both, no external assets
+  in either, `connect-src 'none'` in both, bridge-routed
+  network access in both. The modes differ only on policy
+  strictness: Wasm/eval permitted in Preview's CSP and
+  blocked in Hardened's; fullscreen optional in Preview
+  behind operator gate, stripped in Hardened; legacy
+  `UIResourceRenderer` retired on chat in Preview, retired
+  across all surfaces in Hardened; `manifestHash` review
+  active in Hardened, scaffolded but inactive in Preview.
+  App authors target one profile; the migration path
+  between modes does not change asset or networking
+  contracts.
+
+- **No blocking `tasks/result` waiter in v1.** The Tasks
+  spec supports a blocking `tasks/result` call but does not
+  require host UIs to back "wait for result" with one. v13
+  cuts the dedicated blocking waiter and implements "wait
+  for result" as a UI mode on top of the shared poller:
+  the host keeps polling at `pollInterval`, the UI shows a
+  waiting state, and on the first terminal status the host
+  issues exactly one `tasks/result` to fetch the envelope.
+  This deletes the entire wait-restart state machine that
+  v12 introduced for session loss mid-wait, the concurrent
+  wait/poll duality, and the dedicated re-init / retry
+  budget. Latency cost: at most one `pollInterval` of
+  additional completion delay. Code cost saved: an entire
+  protocol corner that mostly served a feature users
+  experience as "keep watching this task until it
+  finishes."
+
+- **`authContextHash` binds to a derived snapshot, not a
+  counter.** v12's `authRevision` field placed the
+  ownership invariant on a manually-bumped counter that
+  has to bump on every auth-relevant config edit and
+  never on cosmetic edits — the kind of procedural rule
+  that rots in maintenance, where a missed bump leaks
+  access to tasks that should be hidden. v13 hashes the
+  auth-relevant config snapshot directly (server URL,
+  transport type, OAuth issuer/client_id/sorted-scopes,
+  API key reference, credential mapping policy), making
+  the invariant structural rather than procedural.
+  Cosmetic fields (display name, description, icon,
+  docs, default UI settings, fallback height) are
+  explicitly outside the snapshot. Per-field tests
+  guarantee a schema change that adds a new auth-relevant
+  field cannot silently leak across contexts.
+
+- **Bootstrap trust contract is fail-closed.** v13 makes
+  the sandbox proxy's bootstrap explicit: never derive
+  the host origin from `document.referrer`, never accept
+  or send `'*'` as `targetOrigin`, refuse to initialize
+  if the host-controlled `host-bootstrap` postMessage
+  (delivering host origin, view ID, per-view nonce) is
+  absent or arrives from any unexpected origin. A
+  startup health check verifies that `proxy.html` from
+  `MCP_SANDBOX_ORIGIN` carries the required response
+  headers (`Content-Security-Policy: frame-ancestors`,
+  `Cache-Control` no-cache, `Cross-Origin-Resource-Policy`)
+  and refuses to enable Apps capability advertisement
+  otherwise.
+
+- **Exactly-one-match `contents[]` rule.** v11 accepted
+  multi-content `resources/read` responses with a
+  "log extras and ignore" rule. v13 keeps that for
+  non-matching entries but **fails review** when two or
+  more entries match the declared `(uri, mimeType)`
+  pair; the silent "pick one" path was the lone source
+  of nondeterminism in the decoding pipeline.
+
+- **Required text fallback contract.** Servers that mark
+  tools with `_meta.ui.resourceUri` MUST also return a
+  human-meaningful text summary in `CallToolResult.content`.
+  The host renders that text on every non-render path —
+  non-chat surfaces, failed `ui/initialize` relay probes,
+  unsupported browsers, bootstrap health-check failures,
+  and Hardened review refusals. When `content` is empty
+  or trivial, the host renders a single generic "App is
+  unavailable on this surface" card built from `toolInfo`
+  rather than synthesizing data the model has not seen.
+  This collapses three subtly-different fallback
+  experiences into one client-side surface and matches
+  the Apps spec's expectation that app-launching tools
+  also behave as standard tools when the host cannot
+  render UI.
+
+- **`model-immediate-response` is model plumbing only.**
+  The provisional metadata field is fed into the model
+  context as the immediate tool result for the in-flight
+  task call — the spec's narrow scope. v13 explicitly
+  cuts the v12 behavior that turned it into an
+  assistant-visible placeholder turn with model
+  suppression and overwrite-on-final logic. Users see a
+  standard task card in the running-jobs UI; the agent
+  loop has nothing extra to do.
+
+- **Vendor Tasks generated schemas, not just Apps.**
+  Tasks is explicitly experimental and the ownership /
+  metadata / error semantics are precise enough that
+  drift between the package and the host implementation
+  will hurt. v13 vendors generated TypeScript types and
+  JSON Schemas for Tasks `2025-11-25` into
+  `packages/data-provider/src/mcp-tasks/schemas/`,
+  alongside the Apps schemas v11 already vendored.
+  Package upgrades remain independent of schema updates.
+
+- **Validator drops static JS inspection.** v12's
+  validator tried to reject inline JS containing dynamic
+  `import()` to remote URLs at review time. v13 cuts
+  that — it is hard to do reliably, the false-positive
+  cost is real, and the inner-view CSP at runtime
+  already blocks dynamic imports, `fetch`, `eval`, and
+  `WebAssembly.instantiate` per the Hardened/Preview
+  policy split. The validator now rejects only the
+  declarative URL-bearing tags (`<script src>`,
+  `<link href>`, etc.) and `<base>`. Cheaper to reason
+  about; fewer false positives.
+
+- **Effort rebalance.** Phase 1 grows from ~2–2.5 weeks
+  to ~2.5–3 weeks because the unified authoring profile
+  moves the validator and `connect-src 'none'`
+  enforcement up. Phase 2P shrinks accordingly. Phase 4
+  shrinks from ~2 weeks to ~1.5–2 weeks because the
+  blocking-waiter state machine is gone.
 
 ---
 
