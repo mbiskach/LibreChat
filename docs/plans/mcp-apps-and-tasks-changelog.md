@@ -3,7 +3,7 @@
 This file is **revision history**, not implementation guidance.
 The current plan is in [`mcp-apps-and-tasks.md`](./mcp-apps-and-tasks.md).
 
-The plan went through eleven revisions during scoping and
+The plan went through twelve revisions during scoping and
 review, each in response to a specific gap or contradiction
 caught in review. Implementers should read the plan; this
 file is for reviewers, future maintainers, and anyone trying
@@ -19,9 +19,168 @@ to understand why a particular decision is the way it is.
 | v9 | Adopt upstream PR #11799 substrate | "Adopt-then-layer," not parallel-build; pin commit SHAs |
 | v10 | Decisions frozen | Single `MCP_APPS_MODE` enum; chat-only surface matrix; Hardened as LibreChat profile; Wasm/eval excluded in Hardened; drop separate `MCPAppInstance`; shared fan-out Tasks poller |
 | v11 | Reality check | Unified outer-sandbox topology; #11799 is a local patchset; stable-identity `authContextHash`; lazy remount; multi-content `resources/read` accepted; vendor generated schemas |
+| v12 | Implementation prep | Preview compatibility clause; relay validation promoted to Phase 1; `_meta` passthrough as Preview gate; capability-conditional Tasks UX; `authRevision` replaces `configRevision`; host-side terminal-result cache cut entirely; auto-repin advisory pinning; deterministic wait-restart on session loss |
 
 Full per-revision narratives below; full earlier-revision
 narratives (v1–v5) are available in git history.
+
+---
+
+## v12 — Implementation prep
+
+Final scoping pass before implementation begins. v12
+addresses an external review that flagged six implementation
+blockers in v11: an underspecified Preview compatibility
+contract under the unified `srcdoc` topology, capability
+unrealism in the Tasks UX, an `authContextHash` input that
+would orphan tasks on cosmetic edits, an unnecessary
+host-side terminal-result cache, an undefined session-restart
+path during a blocking wait, and ecosystem failure modes
+(Safari relay, `_meta` drop) parked as Hardened polish even
+though they affect Preview the moment topology unifies.
+v12 closes each issue, simplifies the advisory-pinning state
+machine, and removes residual contradictory prose. v11's
+frozen decisions remain in force; v12 only adjusts where
+external review forced changes.
+
+**v12 decisions (binding; supersede v11 where they conflict):**
+
+- **Preview compatibility clause.** Once Phase 1 unifies
+  Preview and Hardened onto `srcdoc` under
+  `MCP_SANDBOX_ORIGIN`, two upstream-style behaviors stop
+  being reliable in Preview and are explicitly cut:
+  - **Relative external asset URLs** (`<script src>`,
+    `<link href>`, `<img src>`, frame `src`) inside the
+    resource HTML are rejected at review time in Preview
+    too, because `about:srcdoc` resolves relative URLs
+    against the embedding document, not against `ui://`.
+    Absolute HTTPS URLs covered by `resourceDomains` remain
+    accepted in Preview; Hardened ignores `resourceDomains`
+    entirely.
+  - **Direct browser networking** from the inner frame is
+    documented as best-effort, unsupported in production
+    in Preview. The opaque-origin (`null`) inner frame
+    breaks cookies, conservative CORS, OAuth, and
+    origin-based API allowlists. App authors are
+    documented to route via `tools/call` /
+    `resources/read` / `ui/open-link` for any production
+    networking. Preview is **not** positioned as a natural
+    first step toward Hardened; apps targeting Hardened
+    build to the Hardened profile directly.
+
+- **Hop-specific relay validation, proxy-stamped per-view
+  nonce, folded `ui/initialize` probe, and `_meta`
+  passthrough are all Preview gates (Phase 1) in v12, not
+  Hardened polish.** The unified topology means
+  WebKit/Safari's `event.source === window` regression
+  affects Preview the moment Phase 1 lands. The proxy-
+  stamped per-view nonce is the host-vs-proxy trust
+  primitive that survives whatever the inner view does, so
+  it must apply on the same hop in both modes. The folded
+  init probe is the relay self-test that detects engines
+  where this trust primitive cannot be enforced. `_meta`
+  passthrough is the contract every task-aware app
+  depends on, and the basic Apps host has a known
+  upstream regression that drops `_meta` from
+  `tool-result`. v12 promotes all four to Phase 1 exit
+  criteria; Phase 2H is now a policy-only delta.
+
+- **Tasks UX is capability-conditional.** The Tasks spec
+  makes `tasks.list` and `tasks.cancel` independently
+  negotiated sub-capabilities and explicitly warns that
+  servers without a stable requestor identity should not
+  advertise `tasks.list`. v12 conditions the jobs panel,
+  cancel affordance, and cross-session task discovery on
+  the negotiated capabilities:
+  - Without `tasks.list`: per-conversation handles view
+    only, no global cross-session view, no `tasks/list`
+    invocation against that server.
+  - Without `tasks.cancel`: cancel button is not rendered
+    for that server's task rows.
+  - Negotiated capabilities are persisted on the `MCPTask`
+    row (`serverTasksCapabilities`) so the UX stays
+    consistent across reload and reconnect.
+
+- **`authContextHash` binds to `authRevision`, not
+  `configRevision`.** v11's payload included
+  `configRevision`, a counter that bumped on every
+  server-config edit. Cosmetic edits (display name, docs,
+  icon, default UI settings, fallback height) would
+  therefore have orphaned in-flight tasks even though the
+  effective authorization context did not change. v12
+  replaces that input with `authRevision`, a counter that
+  bumps **only** on auth-relevant config changes (server
+  URL, transport, auth scheme, OAuth issuer/client/scopes,
+  API key reference, per-user credential mapping policy).
+  Display, docs, icon, and default UI settings do not
+  affect the hash. The unit-test corpus adds a named
+  "non-auth config edits do not change the hash" case to
+  guard against regressions.
+
+- **No host-side terminal-result cache.** v11's Tasks
+  storage was metadata + an optional cached terminal
+  envelope materialized on explicit detail entry, with
+  blob offload and semantic-equivalence rehydration. The
+  spec already says `tasks/result` returns the underlying
+  final result for terminal tasks, blocks for
+  non-terminal, and lets receivers purge after TTL. v12
+  cuts the cache entirely. `MCPTask` holds **metadata
+  only**; on detail entry or explicit wait the host calls
+  `tasks/result` **live** every time. This removes
+  BSON-size management, blob offload, semantic
+  rehydration, expiry semantics, and an extra retention
+  boundary. If repeat fetches become a latency or load
+  issue in production, caching can be re-introduced
+  later behind data rather than ahead of it.
+
+- **Wait-restart on session loss is deterministic.** A
+  blocking `tasks/result` wait that fails with HTTP 404 /
+  session-lost triggers exactly **one** re-init +
+  revalidate + retry budget: re-init the MCP session,
+  call `tasks/get` once on the new session, then either
+  retry `tasks/result` (non-terminal), forward the
+  terminal envelope (terminal), or mark
+  terminal-with-error (not found). A second
+  `tasks/result` failure surfaces a clear error; the host
+  does **not** retry further and does **not** silently
+  downgrade to polling. Goal: no duplicate concurrent
+  waiters, no surprise polling of a wait the user did not
+  reopen.
+
+- **Advisory manifest divergence auto-repins.** v11
+  required a one-click re-acknowledge on every advisory-
+  mode divergence, which adds friction without security
+  upside. v12 changes advisory mode to auto-repin the
+  new manifest, render it, and surface a host-controlled
+  banner naming the server, the manifestHash short-prefix
+  before/after, and what changed (bytes, sandbox flags,
+  permissions, network policy, URI, trust-policy
+  version). Hard refuse is reserved for strict pinning
+  (`MCP_APPS_HASH_PINNING_REQUIRED=true`).
+
+- **`MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES` becomes
+  `MCP_TASKS_MAX_RESULT_FORWARD_BYTES`.** With no cache,
+  the limit no longer governs inline storage vs blob
+  offload. It now caps a live `tasks/result` envelope at
+  forward time: model-path serializations are truncated
+  with a marker; view-path forwards surface a chrome
+  warning. Nothing is persisted.
+
+- **Goal language tightened.** v11 still described the
+  intent as "parity with the stable subset of Apps."
+  Decision 22 has redefined Hardened as the LibreChat
+  Hardened App Profile (a stricter subset, not parity);
+  v12 removes the residual "parity" wording so
+  implementers stop chasing a contradiction.
+
+- **Effort estimates rebalanced.** Phase 1 grows from
+  ~1.5–2 weeks to ~2–2.5 weeks because relay validation,
+  the proxy-stamped nonce, the folded init probe, and
+  `_meta` passthrough verification all moved up from
+  Phase 2H. Phase 2H shrinks correspondingly to ~1.5–2
+  weeks. The total Apps work is approximately unchanged;
+  v12 redistributes it across phases so Preview ships
+  with the security-relevant relay primitives in place.
 
 ---
 

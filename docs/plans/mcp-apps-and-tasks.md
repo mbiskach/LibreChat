@@ -3,7 +3,7 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v11. See
+**Revision:** v12. See
 [`mcp-apps-and-tasks-changelog.md`](./mcp-apps-and-tasks-changelog.md)
 for the per-revision decision history. This file describes
 the current frozen state; implementers do not need to read
@@ -74,6 +74,14 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
 - **[T]** Status-only jobs panel; `tasks/result` on detail
   entry or explicit wait — nothing else. Progress UI deferred
   to upstream PR #12535 reuse.
+- **[T]** Tasks UX is **capability-conditional** (v12). The
+  jobs panel, cancel affordance, and cross-session task
+  recovery all condition on the server's negotiated
+  `tasks.list` / `tasks.cancel` sub-capabilities. When a
+  capability is absent, the corresponding affordance is not
+  rendered. This honors the spec's explicit warning that
+  servers without a stable requestor identity should not
+  advertise `tasks.list`.
 - **[A]** Lazy-loaded `AppBridge` runtime on the client.
 - **[A]** Sizing fallback height + `shrinkWrap: false` opt-out.
   (Preview also accepts upstream `maxHeight`.)
@@ -90,14 +98,59 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
   `resourceUri` and whose MIME parses as
   `text/html;profile=mcp-app`. Extra entries are logged and
   ignored. No blanket multi-content rejection.
-- **[T]** `MCPTask` holds task metadata + an optional cached
-  terminal result envelope materialized only on explicit
-  detail fetch. Bounded by `createdAt + ttl`. No request-
-  envelope persistence, no subscriber durability, no progress
-  checkpointing.
+- **[T]** `MCPTask` holds **task metadata only** (v12). No
+  cached terminal result envelope, no blob offload, no
+  rehydration persistence. `tasks/result` is fetched **live**
+  on explicit detail entry or explicit wait. Bounded by
+  `createdAt + ttl`. No request-envelope persistence, no
+  subscriber durability, no progress checkpointing.
 - **[T]** Tasks-only over Streamable HTTP.
 - **[T]** Outstanding-task revalidation on HTTP 404 lives in
   Phase 4 (Tasks-specific), not Phase 0.
+- **[T]** Session loss during a **blocking
+  `tasks/result` wait** is handled deterministically (v12):
+  on HTTP 404, the host re-initializes the MCP session,
+  revalidates the task via `tasks/get` on the new session
+  (single retry budget), and either resumes the wait via a
+  fresh `tasks/result` (if non-terminal), or surfaces the
+  terminal envelope, or returns a clear "task lost across
+  re-init" error. The host does **not** spawn a second
+  concurrent waiter and does **not** silently downgrade to
+  polling. The single retry is bounded to one re-init per
+  wait.
+- **[A]** Advisory manifest divergence **auto-repins** (v12).
+  In the default (advisory) mode, the host renders the new
+  manifest immediately, repins it, and surfaces a host-
+  controlled banner that names the server, the manifest
+  short-prefix, and what changed. There is **no** blocking
+  re-acknowledge click. Hard refuse is reserved for
+  `MCP_APPS_HASH_PINNING_REQUIRED=true` (strict pinning).
+- **[P]** **Preview compatibility clause** (v12). Once Phase 1
+  unifies both modes onto `srcdoc` under
+  `MCP_SANDBOX_ORIGIN`, two upstream-style behaviors are
+  no longer reliable in Preview and are explicitly cut:
+  - Relative external asset URLs (`<script src>`,
+    `<link href>`, `<img src>`, frame `src`) inside the
+    resource HTML are **rejected at review time** in Preview
+    as well as Hardened — they would resolve against
+    `MCP_SANDBOX_ORIGIN` under `srcdoc`, not against
+    `ui://`. Preview keeps `_meta.ui.csp.resourceDomains`
+    parsing for absolute HTTPS asset references but
+    rejects any relative `src`/`href`.
+  - Direct browser networking from the inner frame is
+    **best-effort, unsupported in production** in Preview.
+    The inner-frame origin is opaque (`null`), which
+    breaks cookies, conservative CORS, OAuth, and origin-
+    based API allowlists. `connectDomains` is honored in
+    the rendered CSP per upstream, but app authors are
+    documented to route through the bridge
+    (`tools/call` / `resources/read` / `ui/open-link`)
+    for anything that needs credentials, cookies, or a
+    stable browser-side identity.
+  - Preview is documented as a **non-portable authoring
+    mode**, not as a natural first step toward Hardened.
+    Apps targeting Hardened build to the Hardened profile
+    directly.
 - **[A]** Sequential release train: Apps Preview → Tasks v1 →
   Apps Hardened.
 - **[A]** Phase 1 pins a specific commit SHA on
@@ -109,9 +162,11 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
 
 Bring LibreChat to a useful, conformant subset of the MCP extensions for
 interactive UIs (**MCP Apps**, SEP-1865, stable 2026-01-26) and long-running
-operations (**MCP Tasks**, 2025-11-25, experimental). The intent is parity
-with the stable subset of Apps and a deliberately narrow polling-first
-Tasks v1.
+operations (**MCP Tasks**, 2025-11-25, experimental). Apps Preview adopts
+upstream PR #11799 substantially as-is on the chat surface; Apps Hardened
+is a stricter **LibreChat Hardened App Profile**, **not** stable-spec
+parity (see decision 22). Tasks v1 is a deliberately narrow,
+capability-conditional, polling-first subset.
 
 ## Closed go/no-go decisions
 
@@ -136,43 +191,72 @@ Tasks v1.
    explicit detail entry or explicit "wait for result" — there is
    no opportunistic terminal-result fetch. No background
    API-process poller, no durable subscriber registry.
-4. **Authorization context identifier (v11 stable-identity
+4. **Authorization context identifier (v12 auth-revision
    shape).** v1 binds task ownership to a stable
    `authContextHash` over **stable identity inputs only**,
-   not over live bearer-token bytes. Inputs:
-   `userId`, `mcpServerId`, `credentialSource`,
-   `oauthSubject || apiKeyFingerprint`, `configRevision`.
+   not over live bearer-token bytes and not over every
+   server-config edit. Inputs: `userId`, `mcpServerId`,
+   `credentialSource`,
+   `oauthSubject || apiKeyFingerprint`, **`authRevision`**.
    `headerAuthFingerprint` (over the live `Authorization`
    header value) was in v10 and is **removed in v11** — it
    would cause normal OAuth refresh to orphan in-flight
-   tasks. Token rotation does **not** change
-   `authContextHash`. Identity-level changes (user logout,
-   server reconfigured, OAuth subject changes, API key
-   rotated, config revision bumped) **do** change the hash
-   and invalidate ownership.
+   tasks. `configRevision` (every server-config edit) was
+   in v11 and is **replaced in v12** by `authRevision`.
+   `authRevision` increments **only** when **auth-relevant
+   server config changes** — server URL/endpoint, transport
+   type, auth scheme, OAuth issuer/client_id/scopes, API
+   key reference, per-user credential mapping policy.
+   Display name, description, icon, docs, default UI
+   settings, fallback height, and other non-auth metadata
+   edits do **not** bump `authRevision` and do **not**
+   orphan in-flight tasks. Token rotation does **not**
+   change `authContextHash`. Identity-level or
+   auth-relevant changes (user logout, server URL changed,
+   OAuth subject changes, API key rotated, OAuth scopes
+   changed, `authRevision` bumped) **do** change the hash
+   and invalidate ownership. The human-readable tuple
+   `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
+   is kept for logs and UI; the binding key is the hash.
 5. **`_meta.ui.domain` in v1.** Explicitly **unsupported**. Resources
    declaring `domain` are rejected at review time with a clear error
    message. v1 collapses everything to one `MCP_SANDBOX_ORIGIN`.
-6. **Asset policy: self-contained HTML only.** v1 approves
-   **bytes**, not origins. The resource HTML must be
-   self-contained: inline `<script>` and `<style>`, `data:`
-   images permitted, and **no** `<script src>`, `<link href>`,
-   `<img src>` to remote origins, **no** `<base>`. The review
-   pipeline rejects any external-asset reference at review time.
-   `_meta.ui.csp.resourceDomains` is **ignored** in v1.
-6a. **Network policy: no direct browser networking in v1.**
-    The default inner CSP has `connect-src 'none'`. Apps cannot
-    call out via `fetch`, XHR, or WebSocket from the view JS.
-    `_meta.ui.csp.connectDomains` is **also ignored** in v1;
-    the field is parsed but never installed in the runtime CSP.
-    All app-driven network access flows through the bridge:
-    `tools/call`, `resources/read`, and `ui/open-link`. The
-    rationale is that without `allow-same-origin` and without
-    `_meta.ui.domain`, the inner frame's network identity is
-    `null`, which interacts badly with conservative CORS,
-    cookies, OAuth, and origin-based API allowlists. Re-
-    introducing `connect-src` from server metadata is post-v1
-    and depends on a stable-origin design.
+6. **Asset policy: self-contained HTML in Hardened; no
+   relative external asset URLs in Preview.** Hardened v1
+   approves **bytes**, not origins. The resource HTML must
+   be self-contained: inline `<script>` and `<style>`,
+   `data:` images permitted, and **no** `<script src>`,
+   `<link href>`, `<img src>` to remote origins, **no**
+   `<base>`. Preview is more permissive on **absolute
+   HTTPS** external assets (honoring upstream
+   `_meta.ui.csp.resourceDomains` in the rendered CSP), but
+   v12 **also rejects relative external `src`/`href` in
+   Preview** because both modes now use `srcdoc` under
+   `MCP_SANDBOX_ORIGIN` and `about:srcdoc` resolves
+   relative URLs against the embedding document, not
+   against `ui://`. App authors who need external assets
+   in Preview must use absolute HTTPS URLs explicitly
+   listed in `resourceDomains`. Hardened ignores
+   `resourceDomains` entirely. The review pipeline rejects
+   any forbidden construct at review time.
+6a. **Network policy: bridge-routed by default; direct
+    browser networking is best-effort in Preview, blocked
+    in Hardened.** Hardened sets `connect-src 'none'`; the
+    inner view cannot `fetch`, XHR, or open a WebSocket.
+    `_meta.ui.csp.connectDomains` is parsed but **ignored**
+    in Hardened. Preview honors `connectDomains` in the
+    rendered CSP per upstream, but v12 documents direct
+    browser networking in Preview as **best-effort,
+    unsupported in production**: under the unified `srcdoc`
+    topology the inner-frame origin is opaque (`null`),
+    which breaks cookies, conservative CORS, OAuth, and
+    origin-based API allowlists. App authors are documented
+    to route through the bridge (`tools/call`,
+    `resources/read`, `ui/open-link`) for anything that
+    needs credentials or a stable browser-side identity in
+    either mode. Re-introducing reliable `connect-src` from
+    server metadata is post-v1 and depends on a
+    stable-origin design.
 6b. **Approval is over a launch manifest, not just HTML.**
     `manifestHash` is the canonical hash over: decoded HTML,
     host-filtered effective sandbox flags, effective iframe
@@ -273,10 +357,21 @@ Tasks v1.
     intentionally narrow and is not a state-management store.
     Apps that need durable view state keep it on their MCP
     server. There is no separate `MCPAppInstance` collection.
-14. **Host-cached task results expire at upstream TTL.** Any
-    locally cached `tasks/result` payload expires no later
-    than `createdAt + ttl` as reported by the server.
-    Persistence beyond upstream TTL is post-v1.
+14. **No host-side terminal-result cache (v12).** Earlier
+    revisions cached `tasks/result` payloads under upstream
+    TTL with blob offload + semantic-equivalence
+    rehydration. v12 **cuts that entire surface from v1**.
+    The host stores task **metadata only**; on explicit
+    detail entry or explicit wait, the host calls
+    `tasks/result` **live** against the server. The server
+    is the single source of truth for terminal payloads
+    and may legitimately answer "task expired" past
+    `createdAt + ttl`. Removing the cache eliminates BSON-
+    size management, blob offload, semantic rehydration,
+    expiry semantics, and another retention boundary to
+    secure. If repeated live fetches prove too slow in
+    production, caching can be added later behind the
+    same metadata model rather than ahead of it.
 15. **Surface matrix by mode (legacy renderer retirement).**
     - `MCP_APPS_MODE = "disabled"`: legacy
       `UIResourceRenderer` is the only path. Renders on
@@ -311,8 +406,8 @@ Tasks v1.
     - `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW = 8 MiB`
       (view-path truncation with marker; model path
       truncated separately).
-    - `MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES = 12 MiB` inline
-      (above triggers blob offload).
+    - `MCP_TASKS_MAX_RESULT_FORWARD_BYTES = 12 MiB`
+      (live forward cap; no cache exists).
     - `MCP_APPS_TEARDOWN_WAIT_MS = 1500`.
     - `MCP_APPS_VIEW_RPC_RATE_PER_MIN = 600` (request
       throttle per view).
@@ -325,7 +420,7 @@ Tasks v1.
     `canonicalJSON` is RFC 8785 JCS-equivalent (sorted
     keys, no whitespace, no insignificant differences) and
     `authPayload = { userId, mcpServerId, credentialSource,
-    oauthSubject, apiKeyFingerprint, configRevision }`.
+    oauthSubject, apiKeyFingerprint, authRevision }`.
     All six fields are required; missing fields are
     explicit `null` so the hash distinguishes "absent"
     from "empty". `oauthSubject` is the OAuth `sub` claim
@@ -333,11 +428,19 @@ Tasks v1.
     `sha256(api_key)`. **Exactly one of `oauthSubject` or
     `apiKeyFingerprint` is non-null per task** (the other
     is `null`); `credentialSource` says which.
-    `headerAuthFingerprint` is **not** in the payload — see
-    decision 4 for why. The function lives in
-    `packages/api` and has a dedicated unit-test corpus
-    that includes a "OAuth refresh does not change the
-    hash" test case.
+    `authRevision` is the server's monotonic
+    auth-relevant-config revision counter; it bumps **only**
+    on auth-relevant config changes (URL, transport, auth
+    scheme, OAuth issuer/client/scopes, API key reference,
+    per-user credential mapping policy) and explicitly
+    **does not** bump on display-name, description, icon,
+    docs, default-UI-settings, or other non-auth metadata
+    edits. `headerAuthFingerprint` is **not** in the
+    payload — see decision 4 for why. The function lives
+    in `packages/api` and has a dedicated unit-test corpus
+    that includes named "OAuth refresh does not change the
+    hash" and "non-auth config edits do not change the
+    hash" test cases.
 19. **Adopt upstream PR #11799 + `dev` transport fixes as
     the substrate, then layer the Hardened delta.**
     Implementation does not parallel-build. Phase 0 starts
@@ -404,18 +507,23 @@ Tasks v1.
     on first subscribe. Per-subscriber loops are an
     anti-pattern in this design.
 25. **Review flow is auto-allow + manifest pinning + kill
-    switch.** No human approval queue, no admin approval
-    UI in v1. The host runs the decoding pipeline, computes
-    `manifestHash`, stores the manifest under
-    `MCPResourceReview`, and renders. On manifest
-    divergence the user sees a "this app has been updated"
-    notice with a one-click re-acknowledge action, and
-    the new manifest is pinned. `MCP_APPS_KILL_SWITCH`
-    (off by default) refuses all Apps rendering instantly
-    if an operator needs to disable in flight.
-    `MCP_APPS_HASH_PINNING_REQUIRED` remains the strict-
-    mode setting where divergence is a hard refuse instead
-    of a notice.
+    switch (v12 auto-repin in advisory mode).** No human
+    approval queue, no admin approval UI in v1. The host
+    runs the decoding pipeline, computes `manifestHash`,
+    stores the manifest under `MCPResourceReview`, and
+    renders. On manifest divergence in **advisory** (default)
+    mode, the host **auto-repins to the new manifest** and
+    renders it; a host-controlled banner above the view
+    surfaces the change (server identity, manifestHash
+    short-prefix before/after, what changed — bytes,
+    sandbox flags, permissions, network policy, URI, or
+    trust-policy version). There is **no** blocking
+    re-acknowledge click in advisory mode. In **strict**
+    mode (`MCP_APPS_HASH_PINNING_REQUIRED=true`) divergence
+    is a hard refuse with the same banner content but no
+    rendering. `MCP_APPS_KILL_SWITCH` (off by default)
+    refuses all Apps rendering instantly if an operator
+    needs to disable in flight.
 26. **`input_required` is a deliberate restricted profile,
     not protocol-native behavior.** The Tasks spec says
     requestors should preemptively call `tasks/result`
@@ -427,21 +535,24 @@ Tasks v1.
     message, and offers cancel. Documented as a named
     subset decision in operator docs and in the Tasks
     operator guide so server authors are not surprised.
-27. **Tasks storage is metadata + on-demand result cache.**
-    `MCPTask` holds task metadata
+27. **Tasks storage is metadata only (v12).** `MCPTask`
+    holds task metadata
     (`taskId`, `authContextHash`, `mcpServerId`, `sessionId`,
     `status`, `hostHandlingState`, `createdAt`,
     `lastUpdatedAt`, `ttl`, `pollInterval`,
     `progressToken`, `modelImmediateResponse`, `lastSeen`,
-    `correlationConversationId`) plus an optional cached
-    terminal result envelope, materialized **only** when
-    the user fetches the result through the explicit detail
-    path. The cache row's lifetime is bounded by
-    `createdAt + ttl`. There is no persistence of the
-    original request envelope, no durable subscriber
-    registry, no progress checkpointing. Pointerized blob
-    offload still applies to oversized terminal envelopes
-    when they are cached.
+    `correlationConversationId`,
+    `serverTasksCapabilities`). **No** terminal result
+    envelope is cached in v1; on explicit detail entry or
+    explicit wait the host calls `tasks/result` **live**.
+    There is no blob offload, no semantic-rehydration
+    persistence, no original-request-envelope persistence,
+    no durable subscriber registry, no progress
+    checkpointing. The MongoDB TTL index on
+    `createdAt + ttl` removes stale metadata
+    automatically. Server-reported `tasks.list` /
+    `tasks.cancel` capabilities are persisted on the row
+    so capability-conditional UX survives reconnect.
 28. **Preview HostContext is a deliberate minimum.**
     Preview populates `displayMode`, `availableDisplayModes`,
     `containerDimensions`, `toolInfo`, `theme`, `locale`,
@@ -450,6 +561,61 @@ Tasks v1.
     richness are deferred until Hardened or until a real
     app needs them. Truthful subset rather than synthetic
     full surface.
+29. **Tasks UX is capability-conditional (v12).** The
+    Tasks spec makes `tasks.list` and `tasks.cancel`
+    independently negotiated sub-capabilities. The spec
+    explicitly warns that servers without a stable
+    requestor identity should **not** advertise
+    `tasks.list`. v1 honors that:
+    - **`tasks.list` absent on a server.** The jobs
+      panel does **not** show that server's tasks under a
+      "global discovery" rubric. Locally created task
+      handles in the user's current conversations are
+      still tracked in-memory and via the `MCPTask`
+      metadata row; users see a per-conversation jobs
+      view, not a cross-session global view, for that
+      server. The cross-session global view is shown only
+      for servers whose negotiation included `tasks.list`.
+    - **`tasks.cancel` absent on a server.** The cancel
+      button is **not rendered** for that server's task
+      rows. The host does not synthesize a "cancel" path
+      against a server that does not advertise the
+      capability.
+    - The host persists negotiated `tasks.list` /
+      `tasks.cancel` on the `MCPTask` row (and on the
+      in-process server-capabilities cache) so the UX
+      stays consistent across page reloads and reconnects.
+    - This makes Tasks v1 honest against servers that
+      cannot identify requestors, instead of universally
+      promising a global jobs panel that some servers
+      cannot safely back.
+30. **Wait-restart behavior on session loss (v12).**
+    A blocking `tasks/result` wait can be interrupted by
+    HTTP 404 → re-init mid-flight. The host's behavior is:
+    1. The blocking `tasks/result` request fails with the
+       404 / session-lost error.
+    2. The host re-initializes the MCP session (reusing
+       Phase 4's outstanding-task revalidation path).
+    3. The host calls `tasks/get` for the affected
+       `taskId` on the new session **once**.
+    4. If `tasks/get` reports non-terminal status, the
+       host issues **one** fresh `tasks/result` (the
+       single retry budget) on the new session and the
+       wait resumes from the user's perspective.
+    5. If `tasks/get` reports terminal status, the host
+       issues `tasks/result` once and surfaces the
+       envelope.
+    6. If `tasks/get` reports "not found" (server lost
+       the task), the host marks the row terminal-with-
+       error and surfaces a clear "task lost across
+       re-init" message. No further retry.
+    7. If the second `tasks/result` also fails, the host
+       does **not** retry again and does **not** silently
+       downgrade to polling; it surfaces a clear failure
+       and the user can manually retry.
+    Goals: no duplicate concurrent waiters; no surprise
+    polling of a wait the user didn't reopen; one
+    deterministic re-init budget per wait.
 
 ## Pinned protocol versions
 
@@ -481,17 +647,22 @@ v1 rejects non-`user` roles with a clear error.
 | Result-time UI-resource switching | Stable spec defers |
 | State restoration across remounts | Stable spec defers |
 | `ui/message` with non-`user` roles | Stable schema is `user`-only |
-| External assets in resource HTML (relative or absolute) | v1 approves bytes, not origins; HTML must be self-contained |
-| `_meta.ui.csp.resourceDomains` / `frameDomains` / `baseUriDomains` | Corresponding HTML constructs forbidden in v1 |
-| `_meta.ui.csp.connectDomains` | No direct browser networking in v1; route via `tools/call` / `resources/read` / `ui/open-link` |
-| Direct in-app `fetch` / XHR / WebSocket | Inner-frame origin is `null`; no stable origin for CORS / cookies / OAuth in v1 |
+| External assets in resource HTML (Hardened) | Hardened v1 approves bytes, not origins; HTML must be self-contained |
+| Relative external `src`/`href` in resource HTML (Preview and Hardened) | Under unified `srcdoc` topology, relative URLs resolve against `MCP_SANDBOX_ORIGIN`, not against `ui://` |
+| `_meta.ui.csp.resourceDomains` / `frameDomains` / `baseUriDomains` (Hardened) | Corresponding HTML constructs forbidden in Hardened |
+| `_meta.ui.csp.connectDomains` (Hardened) | Hardened blocks direct browser networking; route via `tools/call` / `resources/read` / `ui/open-link` |
+| Reliable direct in-app `fetch` / XHR / WebSocket (Preview) | Best-effort only; inner-frame origin is `null`, no stable origin for CORS / cookies / OAuth |
+| Direct in-app `fetch` / XHR / WebSocket (Hardened) | Cut entirely; bridge-routed only |
 | `_meta.ui.prefersBorder = false` | Trust chrome is mandatory in v1 |
 | Opportunistic terminal-result persistence in Tasks | Cut to reduce hidden retention; `tasks/result` only on detail entry / explicit wait |
+| Host-side terminal-result cache (any layer) | Cut in v12; `tasks/result` is fetched live every time. Removes blob offload, semantic-rehydration persistence, and an extra retention boundary |
+| Cross-session global jobs panel for servers without `tasks.list` | Tasks UX is capability-conditional; per-conversation jobs only when the server cannot identify requestors |
+| Cancel affordance for servers without `tasks.cancel` | Cancel button not rendered when capability is absent |
 | Separate relay-probe protocol surface | Folded into the first relayed `ui/initialize` |
 | Approval over HTML hash alone | Approval binds to `manifestHash` (HTML + sandbox + permissions + network policy + URI + trust-policy version) |
 | Multiplexed / pooled sandbox proxy iframe | One proxy iframe per app instance in v1 |
 | User-agent allow/deny list for browser support | Runtime relay self-test (folded into `ui/initialize`) instead |
-| Locally cached `tasks/result` past upstream TTL | Cache, not durable store; persistence beyond TTL is post-v1 |
+| Locally cached `tasks/result` (any layer) | No cache exists in v12; live fetch on detail/wait |
 | Durable persistence of view-internal app state | Spec defers; remount artifact only re-instantiates the view |
 | Coexistence of legacy `UIResourceRenderer` with new Apps path on same message | Legacy path unreachable when `MCP_APPS_MODE !== "disabled"` |
 | `allow-popups` / `allow-top-navigation` / `allow-forms` sandbox flags | `ui/open-link` is the single navigation/escape path |
@@ -509,7 +680,7 @@ v1 rejects non-`user` roles with a clear error.
 | Operator allowlist promoting `optional` task tools | One policy axis is enough; only `required` becomes a task in v1 |
 | Eager `tasks/result` on jobs-panel open | Status-only by default; detail entry triggers result fetch |
 | `PostMessageTransport` deferred-target queue | Upstream-rejected; construction order is the fix |
-| Byte-for-byte `tasks/result` rehydration | Spec requires semantic equivalence, not serializer-byte equality |
+| Byte-for-byte `tasks/result` rehydration | N/A in v12 — there is no rehydration; the host fetches `tasks/result` live and forwards it without re-encoding |
 
 ## Background
 
@@ -607,13 +778,17 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
 - **Active-subscriber polling.** A poll is owned by an active
   observer (a mounted view, an open jobs panel, an active chat tab
   watching its task). When no observer exists, polling stops; the
-  task continues server-side. On user return, the jobs panel uses
-  `tasks/list` + `tasks/get` to refresh state and surfaces TTL.
+  task continues server-side. On user return, the jobs panel
+  refreshes state via `tasks/get` for each known task; the
+  cross-session `tasks/list` call is issued **only** for
+  servers that advertise the `tasks.list` sub-capability
+  (capability-conditional UX, v12). TTL is surfaced regardless.
 - **Jobs panel is status-only.** Opening the panel does **not**
   call `tasks/result` for any row. It loads task state with
-  `tasks/list` / `tasks/get`, displays status and TTL, and
-  only calls `tasks/result` on (a) explicit detail entry or
-  (b) explicit "wait for result" on an in-flight task. There
+  `tasks/get` (and `tasks/list` for capable servers), displays
+  status and TTL, and only calls `tasks/result` on (a) explicit
+  detail entry or (b) explicit "wait for result" on an
+  in-flight task. There
   is **no opportunistic save** path: a subscribed task that
   reaches terminal while the user is present does **not**
   trigger an automatic `tasks/result`. The mounted view that
@@ -632,21 +807,26 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   `tasks/result` call fails, (b) the user cancels the wait, or
   (c) the user navigates away from the wait state. The user
   sees the same UX either way; the host saves a stream.
-- **Host-side cache TTL.** Any locally cached `tasks/result`
-  payload **must expire at or before `createdAt + ttl`** as
-  reported by the server. Reading after expiry forces a fresh
-  `tasks/result` (which the server may answer with "task
-  expired"). The current `MCPTask` collection is a **cache**,
-  not a durable result store; persistence beyond upstream TTL
-  is post-v1 and would require its own security review. This
-  matches the Tasks spec's allowance for receivers to delete
-  expired tasks and results, and prevents the host from
-  accidentally creating a hidden retention layer.
+- **No host-side terminal-result cache (v12).** v1 does
+  **not** cache `tasks/result` payloads. The `MCPTask`
+  collection holds task **metadata only** (`taskId`,
+  status, timings, ttl, capability flags, correlation
+  fields). On detail entry or explicit wait the host
+  calls `tasks/result` **live** against the server every
+  time; the server is the single source of truth and may
+  answer "task expired" past `createdAt + ttl`. Removing
+  the cache eliminates blob offload, BSON-size
+  management, semantic-rehydration logic, and an extra
+  retention layer to secure. The MongoDB TTL index on
+  `createdAt + ttl` removes stale metadata rows
+  automatically.
 - **`tasks/cancel` after terminal status.** The spec requires the
   receiver to **reject** with `-32602` invalid params. v1 client
-  honors that — the running-jobs cancel button is disabled in
-  terminal states; if a race produces a late cancel, the
-  `-32602` is surfaced as a no-op to the user.
+  honors that — the running-jobs cancel button is **only
+  rendered for servers that advertise `tasks.cancel`** (v12)
+  and is disabled in terminal states; if a race produces a
+  late cancel, the `-32602` is surfaced as a no-op to the
+  user.
 - **Related-task metadata rules**:
   - All requests, notifications, and responses related to a task
     carry `_meta["io.modelcontextprotocol/related-task"] =
@@ -658,22 +838,18 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
     with their own `taskId` — meta tag not required.
   - **`tasks/result` *response* MUST carry the meta tag** because the
     underlying request's result envelope has no `taskId` of its own.
-- **Result fidelity.** `tasks/result` returns the same successful
-  result or JSON-RPC error the underlying request would have
-  produced, with `_meta` preserved (see view-path rules in the
-  Data boundary section). v1 stores **canonical JSON envelopes**
-  preserving enough metadata to reconstruct the semantic response.
-  Oversized payloads (>~12 MiB to leave headroom under the 16 MiB
-  BSON limit) and binary-heavy blobs offload to immutable blob
-  storage. **Pointerization is an internal storage detail.** When
-  responding to `tasks/result`, the host rehydrates the original
-  response shape so it is **semantically equivalent** to what the
-  original request would have returned — same JSON-RPC envelope
-  type (result vs error), same parsed structure for `content` /
-  `structuredContent`, same `_meta`. Byte-for-byte equality of
-  serializer output (key order, whitespace, spacing) is not
-  required; structural and semantic equivalence is. Pointerized
-  blob references must not leak into the caller-visible payload.
+- **Result fidelity (v12).** `tasks/result` is fetched live
+  from the server and forwarded to the requester without
+  host-side rehydration. The server is responsible for the
+  same successful result or JSON-RPC error shape the
+  underlying request would have produced, including
+  `_meta` preservation (see view-path rules in the Data
+  boundary section). The host does not re-encode or
+  pointerize; nothing is cached, so there is no
+  rehydration step. View-path forwarding of the live
+  envelope must preserve `_meta` exactly as the server
+  returned it, including
+  `_meta["io.modelcontextprotocol/related-task"]`.
 - Status notifications are optional; `pollInterval` is advisory; the
   host treats both as hints.
 - Servers may return
@@ -682,17 +858,25 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   task runs.
 - **Authorization context binding via `authContextHash`.** Task
   access is bound to a stable hash over the **normalized
-  effective auth configuration** at task creation: user
-  identity, server identity, resolved credential source,
-  header/auth fingerprint, and config revision. The
-  human-readable tuple
-  `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
+  effective auth-relevant configuration** at task creation:
+  `userId`, `mcpServerId`, `credentialSource`, exactly one of
+  `oauthSubject` or `apiKeyFingerprint`, and `authRevision`
+  (the server's monotonic auth-relevant-config counter that
+  bumps **only** on auth-relevant changes — URL, transport,
+  auth scheme, OAuth issuer/client/scopes, API key reference,
+  per-user credential mapping policy). Display-name,
+  description, icon, docs, default-UI-settings, and other
+  non-auth metadata edits do **not** bump `authRevision` and
+  do **not** orphan in-flight tasks. The human-readable
+  tuple `(userId, mcpServerId, oauthSubject || apiKeyFingerprint)`
   is kept for logs and UI but is **not** the binding key. Any
-  change in the underlying configuration changes the hash,
-  invalidating ownership for the prior context. This guards
-  against the LibreChat-specific risk surface around shared
-  server definitions and per-user credential leakage that
-  recent advisories flagged.
+  change in the auth-relevant configuration (or token-rotation
+  events that are bypassed by design) changes the hash and
+  invalidates ownership. This guards against the
+  LibreChat-specific risk surface around shared server
+  definitions and per-user credential leakage that recent
+  advisories flagged, while keeping ordinary OAuth refresh
+  and unrelated config edits ownership-stable.
 - **Streamable HTTP only.** v1 does not run Tasks over stdio, WS, or
   SSE. Transport reuses `MCP-Session-Id`, sends
   `MCP-Protocol-Version`, and handles HTTP 404 → new MCP session.
@@ -703,6 +887,11 @@ Reference: <https://github.com/modelcontextprotocol/ext-apps>
   scoping).
 - `tasks/list` is cursor-paginated, filtered by authorization
   context, and surfaces underlying JSON-RPC errors verbatim.
+  The host **only** invokes `tasks/list` for servers that
+  advertise the `tasks.list` sub-capability (v12); for servers
+  without it, the host shows a per-conversation handles view
+  built from locally tracked launches and `tasks/get` polling
+  per known `taskId`.
 
 Reference:
 <https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks>
@@ -950,7 +1139,7 @@ Phase 2H (Hardened GA Apps), and Phase 4 (Tasks).
 | Trust UX (mandatory chrome; ignore `prefersBorder=false`) | Phase 2H (Hardened GA) | — |
 | `authContextHash` canonicalizer + unit-test corpus | Phase 0 (Tasks consumes it; Hardened GA also uses it) | `packages/api` |
 | Sizing fallback height + `shrinkWrap: false` opt-out | Phase 2P (alongside upstream `maxHeight`) | — |
-| MCP Tasks (per-tool negotiation, active-subscriber polling, single-path wait, `authContextHash` binding, TTL-bounded cache, semantic-equivalence rehydration) | Missing | — |
+| MCP Tasks (per-tool negotiation, active-subscriber polling, single-path wait, `authContextHash` binding, metadata-only storage with live `tasks/result` forwarding, capability-conditional UX) | Missing | — |
 | Tasks capability negotiation (gated by `MCP_TASKS_ENABLED`) | Missing | — |
 | `model-immediate-response` runtime behavior | Missing | — |
 | Status-only running-jobs UI (cursor-paginated; `tasks/result` on detail entry) | Missing | — |
@@ -1387,7 +1576,7 @@ safety.
 | `MCP_APPS_INITIALIZE_TIMEOUT_MS` | 5000 | Deadline for the first relayed `ui/initialize` to complete the (folded-in) probe |
 | `MCP_APPS_VIEW_RPC_RATE_PER_MIN` | 600 | Inbound JSON-RPC requests per view per minute before throttling/pause |
 | `MCP_APPS_VIEW_NOTIF_RATE_PER_MIN` | 1200 | Inbound notifications per view per minute before throttling/pause |
-| `MCP_TASKS_MAX_RESULT_ENVELOPE_BYTES` | 12 MiB | Inline-stored `tasks/result` envelope size before blob-offload |
+| `MCP_TASKS_MAX_RESULT_FORWARD_BYTES` | 12 MiB | Maximum live `tasks/result` envelope forwarded to a requester before truncation with marker (model path) or chrome-warning truncation (view path). No persistence — v12 cuts the cache. |
 | `MCP_TASKS_PER_USER_QUOTA` | 100 | Maximum live (non-expired) tasks per `authContextHash` |
 | `MCP_APPS_FALLBACK_HEIGHT_PX` | 320 | Fallback iframe height until first non-zero `size-changed` |
 | `MCP_APPS_HASH_PINNING_REQUIRED` | `false` | When `true`, manifest divergence is a hard refuse |
@@ -1405,7 +1594,7 @@ authPayload = {
                     "system_oauth" | "anonymous" | null,
   oauthSubject: string | null,        // OAuth `sub` claim, stable across refresh
   apiKeyFingerprint: string | null,   // sha256(api_key), stable until rotation
-  configRevision: string | null,      // server config monotonic rev
+  authRevision: string | null,        // monotonic; bumps only on auth-relevant config changes
 }
 authContextHash = sha256(canonicalJSON(authPayload))
 ```
@@ -1420,20 +1609,42 @@ rotates that value during normal operation and would orphan
 in-flight tasks under v10's earlier shape. v11's identity-
 only inputs survive token rollover.
 
+`authRevision` (v12) replaces v11's `configRevision`. The
+v11 shape bumped on every server-config edit and would have
+orphaned in-flight tasks for purely cosmetic edits (display
+name, docs, default UI settings, fallback height, icon). v12
+restricts the input to a counter that bumps **only** on
+auth-relevant config changes:
+
+- Server URL or endpoint changes.
+- Transport type changes (e.g. SSE → Streamable HTTP).
+- Auth scheme changes (OAuth → API key, etc.).
+- OAuth issuer, client_id, or allowed-scopes changes.
+- API key reference (mapping) changes.
+- Per-user credential mapping policy changes.
+
+It does **not** bump on display name, description, icon,
+docs, default UI settings, fallback height, or any other
+non-auth metadata edit. Servers expose `authRevision` from
+their config layer; `packages/data-schemas` owns the
+property and a migration that initializes existing rows to
+`authRevision = "1"`.
+
 `canonicalJSON` follows RFC 8785 JCS: lexicographically sorted
 keys, no insignificant whitespace, no trailing commas, UTF-8
 output. Missing fields are explicit `null`, never omitted, so
 "absent" and "empty" are distinguishable. The function lives in
 `packages/api` with a dedicated unit-test corpus covering field
-permutations, null vs missing, round-trip equality, and a
-named "OAuth refresh does not change `authContextHash`" test
-that simulates a token rotation and asserts the hash is
-unchanged.
+permutations, null vs missing, round-trip equality, and named
+"OAuth refresh does not change `authContextHash`" and
+"non-auth config edits do not change `authContextHash`" test
+cases.
 
 ## Data boundary rules
 
-A `CallToolResult` (or rehydrated `tasks/result` envelope) flows
-along **two distinct paths** with opposite preservation rules.
+A `CallToolResult` (or live `tasks/result` envelope forwarded
+from the server) flows along **two distinct paths** with
+opposite preservation rules.
 
 ### Model path (host → LLM)
 
@@ -1459,9 +1670,11 @@ along **two distinct paths** with opposite preservation rules.
   task-aware Apps.
 - Server-defined `_meta` keys outside the reserved namespace must
   also be preserved so app authors can rely on them.
-- The same rule applies to `tasks/result` rehydration on the view
-  path: the rehydrated envelope keeps its `_meta`, including
-  `related-task`.
+- The same rule applies to live `tasks/result` forwarding on
+  the view path: the live envelope from the server keeps its
+  `_meta`, including `related-task`. There is no host-side
+  rehydration step in v12; the host forwards what the server
+  returned.
 
 ### Implementation invariant
 
@@ -1469,9 +1682,10 @@ Two helpers, not one:
 
 - `toModelView(result)` — strips `structuredContent` and `_meta`
   for model context, persistence into model-visible payloads, and
-  replay/rehydration on the model side.
+  replay on the model side.
 - `toViewSurface(result)` — preserves the full envelope for
-  bridge delivery and view-side rehydration.
+  bridge delivery to the view; identical handling for live
+  `tasks/result` forwarding (no rehydration step).
 
 Tests assert both directions: `structuredContent` and `_meta`
 never appear in model-bound serialization, **and** they always
@@ -1684,13 +1898,18 @@ on what `dev` does **not** cover.
   allowlists, per-user task quotas, result-size caps).
   Defaults lean toward denial.
 
-### Phase 1 — Patch #11799, unify topology, scaffold delta (≈1.5–2 weeks)
+### Phase 1 — Patch #11799, unify topology, relay validation, scaffold delta (≈2–2.5 weeks)
 
 End of phase: PR #11799 patched onto the working branch with
-the v11 topology change applied; sandbox bootstrap green for
+the unified topology applied (v11 decision); sandbox bootstrap green for
 authenticated users in an end-to-end test; `MCP_APPS_MODE`
 enum exists but defaults OFF; share / search / plugin surfaces
-fall back to text; Hardened delta scaffolds (manifest hasher,
+fall back to text; **hop-specific relay validation,
+proxy-stamped per-view nonce, and the folded-in
+`ui/initialize` probe are live in Preview** (v12 — promoted
+from former Phase 2H because Preview now shares the unified
+topology); **`_meta` passthrough end-to-end is verified in
+Preview** (v12); Hardened delta scaffolds (manifest hasher,
 content decoder, self-contained-HTML validator) land disabled.
 **No capability advertised yet.**
 
@@ -1731,6 +1950,35 @@ locally; we do not block on upstream cleanup.
   Phase 1 Preview gate; Preview is **not** shippable until
   it is green for both authenticated and just-signed-in
   states.
+- **Hop-specific relay validation + proxy-stamped per-view
+  nonce, in Preview (v12).** The host accepts inbound
+  postMessage **only** from the proxy at exact
+  `MCP_SANDBOX_ORIGIN`, with `event.source` matching the
+  bound proxy window, JSON-RPC envelope schema validating,
+  and the proxy-stamped per-view nonce matching. The host
+  rejects `null`-origin messages. The proxy accepts only
+  opaque-origin messages from its bound inner iframe and
+  stamps the per-view nonce before forwarding. The inner
+  view never sees the nonce. This work was Phase 2H in
+  v11; v12 promotes it to Phase 1 because both modes now
+  share the unified topology and the WebKit/Safari
+  `event.source === window` bug otherwise surfaces in
+  Preview.
+- **Folded-in `ui/initialize` relay probe, in Preview
+  (v12).** The first relayed `ui/initialize` is the relay
+  self-test: schema-valid + correct proxy-stamped nonce +
+  within `MCP_APPS_INITIALIZE_TIMEOUT_MS` ⇒ mount passes.
+  Failure tears down the iframe and falls back to
+  text-only with a clear chrome message. No separate ping
+  protocol surface.
+- **`_meta` passthrough end-to-end, verified in Preview
+  (v12).** `ui/notifications/tool-result` forwards the full
+  `CallToolResult` to the view including `content`,
+  `structuredContent`, and `_meta`, with
+  `_meta["io.modelcontextprotocol/related-task"]` and
+  server-defined `_meta` keys outside the reserved
+  namespace preserved intact. Regression test fails if the
+  inherited bridge drops `_meta`.
 
 **Inherit + adapt:**
 
@@ -1799,7 +2047,8 @@ Preview):**
   most enforcement points are gated on Hardened.
 - `authContextHash` canonicalizer (`packages/api`) +
   unit-test corpus (incl. the "OAuth refresh does not
-  change the hash" test).
+  change the hash" test **and** the "non-auth config edits
+  do not change the hash" test, v12).
 - Tests with `mongodb-memory-server` + real
   `@modelcontextprotocol/sdk` + Playwright cross-origin
   iframes.
@@ -1824,8 +2073,34 @@ Phase 1 exit criteria:
 7. Self-contained-HTML validator rejects every external-asset
    construct in the test corpus (live behind a flag, not yet
    used in the Preview render path).
-8. `authContextHash` unit tests pass, including the OAuth-
-   refresh invariance test.
+8. `authContextHash` unit tests pass, including the
+   OAuth-refresh invariance test **and** the non-auth-edit
+   invariance test (v12).
+9. **Construction-order invariant** is enforced and tested
+   in CI for both the outer host → proxy and proxy → inner
+   iframe orderings; a fixture flipping the order
+   reproduces a dropped `ui/initialize`.
+10. **Hop-specific relay validation + proxy-stamped per-view
+    nonce** are live in **Preview** as well as Hardened
+    (v12 promotion). Both modes run on the same unified
+    topology, so the WebKit/Safari `event.source === window`
+    bug surfaces in Preview if the nonce is not stamped.
+    Tests assert the nonce path on Chromium, Firefox, and
+    WebKit/Safari.
+11. **Folded-in `ui/initialize` relay probe** is live in
+    Preview as well as Hardened (v12 promotion). Probe
+    failure (timeout / schema / nonce) tears down the
+    iframe and falls back to text-only with a clear chrome
+    message.
+12. **`_meta` passthrough** is verified end-to-end in
+    Preview (v12 promotion): `ui/notifications/tool-result`
+    forwards the full `CallToolResult` to the view
+    including `content`, `structuredContent`, and `_meta`,
+    with `_meta["io.modelcontextprotocol/related-task"]`
+    and server-defined `_meta` keys outside the reserved
+    namespace preserved intact. A regression test fails if
+    the inherited bridge drops `_meta` (this is a known
+    upstream regression in basic Apps hosts).
 
 ### Phase 2P — Apps Preview release (≈1–2 weeks)
 
@@ -1893,30 +2168,24 @@ hardening delta is **not yet** active.
   inactive (`MCP_APPS_MODE!="hardened"`). Tasks may
   still be OFF.
 
-### Phase 2H — Apps Hardened (≈2–2.5 weeks, follow-up release)
+### Phase 2H — Apps Hardened (≈1.5–2 weeks, follow-up release)
 
 End of phase: with `MCP_APPS_MODE="hardened"`, the Apps path
 adds policy hardening on top of Phase 1's already-unified
-topology — hop-specific relay validation with proxy-stamped
-nonce, the folded-in `ui/initialize` probe, `connect-src
+topology and Phase 1's relay validation — `connect-src
 'none'`, self-contained HTML, manifest-hash review, Wasm/eval
 exclusion, fullscreen disabled, and full retirement of
 `UIResourceRenderer`. Phase 2H is **policy-only**; the outer
-sandbox topology landed in Phase 1.
+sandbox topology landed in Phase 1, and the hop-specific
+relay validation, proxy-stamped per-view nonce, and folded-in
+`ui/initialize` probe were promoted to Phase 1 in v12 (they
+apply to Preview as well, since both modes share the unified
+topology).
 
-(v11 estimate is shorter than the v10 estimate because the
-sandbox-proxy topology change is no longer Phase 2H work; it
-moved to Phase 1.)
+(v12 estimate is shorter than v11 because the relay
+validation work moved to Phase 1. The remaining Phase 2H
+delta is policy-only.)
 
-- **Policy delta — hop-specific validation + proxy-stamped
-  nonce.** Host rejects `null`-origin messages; proxy stamps
-  the per-view nonce on relayed inbound messages; the inner
-  view never sees or echoes the nonce. (Topology already
-  cross-origin since Phase 1.)
-- **Policy delta — folded-in `ui/initialize` probe.** The
-  first relayed initialize is the relay self-test; failure
-  (timeout / schema / nonce) tears down the iframe and
-  falls back to text-only for that mount.
 - **Policy delta — content decoding + self-contained HTML.**
   Activate the Phase 1 scaffolds. Reject MIME mismatch,
   base64-decode `blob` under `MCP_APPS_MAX_HTML_BYTES`,
@@ -2029,33 +2298,32 @@ for implemented directions.
     On reconnect, subscribers re-register and reload from
     `tasks/get` via the shared poller. No durable subscriber
     state.
-  - **`MCPTask` is metadata + on-demand result cache.**
+  - **`MCPTask` is metadata only (v12).**
     Stores task metadata indexed by
     `(authContextHash, userId, mcpServerId, taskId,
     sessionId, status, hostHandlingState, createdAt,
     lastUpdatedAt, ttl, pollInterval, progressToken,
     modelImmediateResponse, lastSeen,
-    correlationConversationId)`. The terminal response /
-    error envelope is materialized on the row **only when
-    the user fetches the result through the explicit detail
-    path**; it is not eagerly cached on terminal transition.
-    The MongoDB TTL index on `createdAt + ttl` removes
-    stale rows (metadata + cached envelope) automatically.
-    Cached envelopes >12 MiB or binary-heavy blobs offload
-    to immutable blob storage with the envelope referencing
-    them by URL/hash. **No persistence of the original
-    request envelope.** No durable subscriber state.
-    No progress checkpointing. Persistence beyond upstream
-    TTL is post-v1.
-  - **`tasks/result` rehydration**: on retrieval, the host
-    rehydrates the original response shape so it is
-    **semantically equivalent** to what the original underlying
-    request would have returned — same envelope type (result vs
-    error), same parsed structure for `content` /
-    `structuredContent`, and same `_meta` (incl. the
-    `related-task` tag). Byte-for-byte serializer equality is not
-    required. Pointerization is a storage detail and must not
-    leak into the response.
+    correlationConversationId, serverTasksCapabilities)`.
+    There is **no** cached terminal response/error
+    envelope; on detail entry or explicit wait the host
+    calls `tasks/result` **live** every time. The MongoDB
+    TTL index on `createdAt + ttl` removes stale metadata
+    rows automatically. **No** request-envelope
+    persistence, **no** blob offload, **no**
+    semantic-equivalence rehydration, **no** durable
+    subscriber state, **no** progress checkpointing.
+    `serverTasksCapabilities` records the negotiated
+    `tasks.list` / `tasks.cancel` sub-capabilities for
+    capability-conditional UX.
+  - **`tasks/result` is forwarded live (v12).** Removed the
+    rehydration step. The host issues `tasks/result`
+    against the server on detail entry or explicit wait,
+    forwards the live envelope to the requester (model
+    path: stripped per the data-boundary helpers; view
+    path: full envelope including `_meta`). The server is
+    the single source of truth and may answer "task
+    expired" past `createdAt + ttl`.
   - Strict related-task metadata rules:
     - Add on all task-related requests, notifications, and
       responses *except* on `tasks/get` / `tasks/result` /
@@ -2079,26 +2347,53 @@ for implemented directions.
       requestors should preemptively call `tasks/result`;
       v1 deliberately diverges — see decision 26).
     - Do not fabricate a `failed` envelope.
-    - Allow `tasks/cancel` on user request.
+    - Allow `tasks/cancel` on user request **only** when the
+      server advertises `tasks.cancel` (capability-conditional
+      UX, v12). When `tasks.cancel` is absent, no cancel
+      button is rendered and the user is documented to
+      contact the server author.
     - Operator docs ship a named "Unsupported lifecycle
       states" section that enumerates this profile so
       server authors can recognize the subset.
   - **`authContextHash` binding** at task creation; verify on
     every retrieval. `tasks/list` is filtered by current
-    `authContextHash`. Tasks created under a prior context
-    become invisible (and unfetchable) when the underlying
-    auth configuration changes.
+    `authContextHash` (and is only invoked at all when the
+    server advertises the `tasks.list` sub-capability, per
+    decision 29). Tasks created under a prior auth-relevant
+    configuration become invisible (and unfetchable) when
+    that configuration changes (`authRevision` bump, OAuth
+    subject change, credential rotation).
   - **Streamable HTTP only.** Persist `MCP-Session-Id` per task.
     HTTP 404 → start a new MCP session, **revalidate
     outstanding `taskId`s via `tasks/get`** (this work moved
     from Phase 0 to here in v7 because it is Tasks-specific).
     Treat "task not found" as terminal-with-error.
-  - **Cache reads check expiry.** Any read from the `MCPTask`
-    cache (jobs panel, detail view, rehydration) checks
-    `createdAt + ttl`. Expired rows are not served; the host
-    reissues `tasks/result` (which may legitimately return
-    "task expired"). The cache never extends a result's
-    lifetime past the server's stated TTL.
+  - **Wait-restart on session loss (v12).** A blocking
+    `tasks/result` wait that fails with a 404 / session-lost
+    error triggers exactly **one** re-init + revalidate +
+    retry budget per decision 30. After re-init, the host
+    issues `tasks/get` once on the new session, then either
+    issues a single `tasks/result` retry (non-terminal),
+    forwards the terminal envelope (terminal), or marks
+    the task terminal-with-error and surfaces "task lost
+    across re-init" (not found). A second `tasks/result`
+    failure is surfaced; the host does not retry further
+    and does not silently fall back to polling.
+  - **Capability-conditional Tasks UX (v12).** The host
+    persists negotiated `tasks.list` / `tasks.cancel`
+    capabilities on `MCPTask` and on the in-process
+    server-capabilities cache. The jobs panel renders a
+    cross-session global view **only** for servers that
+    advertise `tasks.list`; servers without it surface a
+    per-conversation jobs view (locally tracked handles
+    only) instead. The cancel button is **not rendered**
+    for servers without `tasks.cancel`.
+  - **Metadata reads check expiry.** Any read from the
+    `MCPTask` metadata (jobs panel, detail view) checks
+    `createdAt + ttl`. Expired rows are surfaced as
+    expired (no cached payload exists in v12). On detail
+    entry the host issues `tasks/result` live; the server
+    may legitimately return "task expired".
 - `progressToken` correlated by the related-task meta and routed
   through the bridge to active subscribers. **No durable
   subscriber registry**; subscribers are session-scoped.
@@ -2115,8 +2410,13 @@ for implemented directions.
   `client/src/components/SidePanel/`: cursor-paginated, status
   badges, **status-only by default** (no progress bars in
   v1 — those reuse upstream PR #12535 once it lands and is
-  not a Phase 4 dependency), cancel button (disabled for
-  terminal and `input_required` states), deep-link to
+  not a Phase 4 dependency), **capability-conditional UX**:
+  the cross-session global panel is shown for servers that
+  advertise `tasks.list`; servers without it surface only
+  a per-conversation handles view. The cancel button is
+  rendered **only** for servers that advertise
+  `tasks.cancel` and is disabled for terminal and
+  `input_required` states even when present. Deep-link to
   originating conversation. Localize under
   `com_ui_mcp_task_*`. The `progressToken` is still
   correlated and propagated through the bridge to mounted
@@ -2223,24 +2523,27 @@ to instantiate.
    resource. While mounted, the panel polls. After the user
    closes the chat, polling stops; the task continues
    server-side.
-7. User comes back. The jobs panel calls `tasks/list` (filtered
+7. User comes back. Because the CAD server advertises
+   `tasks.list` and `tasks.cancel`, the host renders the
+   cross-session jobs panel and a cancel affordance for
+   in-flight rows. The panel calls `tasks/list` (filtered
    by `authContextHash`). The panel is status-only and does
    not eagerly call `tasks/result`. The task row shows
    `completed` and a TTL countdown. The user clicks "open
    detail" (single-path wait), at which point the host
    suspends `tasks/get` for that task and issues one
-   `tasks/result`. The cached envelope (still within
-   upstream TTL) rehydrates semantically to the original
-   response shape; its structured content carries an
-   **artifact handle** (`{ artifactId, objectKey }`), not a
-   presigned URL — presigned URLs are time-limited and would
-   already be dead. If the user had returned after upstream
-   TTL, the cache would no longer serve and the server would
-   answer "task expired"; the user would see a clear notice
-   instead of stale data. When the user clicks Download, the
-   view calls a `cad.get_download_url(artifactId)` MCP tool
-   that mints a fresh short-TTL presigned URL; the view then
-   opens it via `ui/open-link` against the host navigation
+   **live** `tasks/result` against the server (v12 — the
+   host does not cache and does not rehydrate). The
+   envelope's structured content carries an **artifact
+   handle** (`{ artifactId, objectKey }`), not a presigned
+   URL — presigned URLs are time-limited and would already
+   be dead. If the user had returned past `createdAt + ttl`,
+   the server may legitimately answer "task expired" and
+   the user sees a clear notice instead of stale data.
+   When the user clicks Download, the view calls a
+   `cad.get_download_url(artifactId)` MCP tool that mints a
+   fresh short-TTL presigned URL; the view then opens it
+   via `ui/open-link` against the host navigation
    allowlist.
 
 ## Risks / open questions
@@ -2264,21 +2567,33 @@ to instantiate.
 - **Self-contained-HTML rule is a real constraint on app
   authors (Hardened GA only).** Hardened GA forbids remote
   scripts, styles, fonts, and images; Preview honors
-  upstream `resourceDomains`. Operator docs explain the
-  difference so app authors do not ship a Preview-only bundle
-  and discover at Hardened GA cutover that it is rejected.
-- **No direct browser networking is the bigger Hardened-GA
-  constraint.** Hardened GA cuts in-app `fetch` / XHR /
-  WebSocket entirely; Preview keeps the upstream
-  `connectDomains` model. Apps whose bundle calls a
-  third-party API directly will keep working in Preview but
-  break at Hardened GA cutover unless they migrate to
-  bridge-routed tools. The reason is that without
-  `allow-same-origin` on the inner frame and without
-  `_meta.ui.domain`, the inner-frame origin is `null`, which
-  fails for conservative CORS, cookies, OAuth, and
-  origin-based API allowlists. Re-introducing `connect-src`
-  is post-Hardened-GA and depends on a stable-origin design.
+  absolute HTTPS URLs in upstream `resourceDomains`.
+  Operator docs explain the difference so app authors do
+  not ship a Preview-only bundle and discover at Hardened
+  GA cutover that it is rejected.
+- **Relative external URLs are rejected in both modes
+  (v12).** Even Preview rejects relative `<script src>` /
+  `<link href>` / `<img src>` / frame `src` because under
+  the unified `srcdoc` topology these resolve against
+  `MCP_SANDBOX_ORIGIN` rather than against `ui://`. App
+  authors using build tooling that emits relative URLs
+  must either inline assets or rewrite to absolute HTTPS
+  URLs covered by `resourceDomains`.
+- **Direct browser networking in Preview is best-effort
+  (v12).** Hardened GA cuts in-app `fetch` / XHR /
+  WebSocket entirely. Preview honors upstream
+  `connectDomains`, but the unified `srcdoc` topology
+  forces an opaque-origin (`null`) inner frame, which
+  breaks cookies, conservative CORS, OAuth, and
+  origin-based API allowlists. Apps that depend on
+  credentialed direct browser networking will keep working
+  for anonymous public APIs and break for everything else.
+  Operator docs label Preview as a non-portable authoring
+  mode and recommend bridge-routed access
+  (`tools/call` / `resources/read` / `ui/open-link`) for
+  any app intended to ship in production. Re-introducing
+  reliable `connect-src` is post-Hardened-GA and depends
+  on a stable-origin design.
 - **Approval is over a manifest, not just bytes.** Hash
   divergence catches policy drift (sandbox, permissions,
   network policy, URI, trust-policy version), not just byte
@@ -2338,19 +2653,37 @@ to instantiate.
   when WebKit fails it, the user sees a clear text-only
   fallback message. If upstream lands a fix, support resumes
   automatically without a code change.
-- **TTL-bound result retention is now an explicit invariant.**
-  Local cache cannot extend a result's lifetime past the
-  server's `createdAt + ttl`. The jobs panel surfaces TTL so
-  users can see when a result will expire and explicitly
-  fetch it before then. Persistence beyond upstream TTL is
-  post-v1 and would require its own security review.
+- **No host-side terminal-result cache (v12).** Removing
+  the cache simplifies the retention surface but makes
+  every detail-entry / explicit-wait click a live
+  `tasks/result` round-trip. If repeat fetches become a
+  product-perceptible latency or load issue, caching can
+  be re-introduced later behind the metadata model. The
+  jobs panel surfaces TTL so users can see when a result
+  will expire and explicitly fetch it before then. Past
+  TTL the server may legitimately respond "task expired"
+  and the host surfaces that without inventing a fallback.
 - **`authContextHash` invalidation can hide tasks.** If a user
-  rotates credentials or an operator changes the server
-  config in a way that affects the auth fingerprint, tasks
-  created under the prior context become invisible by design.
-  The UI must explain this rather than show an empty list as
-  if no tasks exist; otherwise the user thinks the system
+  rotates credentials or an operator changes
+  **auth-relevant** server config (URL, transport, OAuth
+  issuer/client/scopes, API key reference, credential
+  mapping policy), tasks created under the prior context
+  become invisible by design. v12 narrows the trigger from
+  any config edit (v11's `configRevision`) to auth-relevant
+  config edits only (v12's `authRevision`), so cosmetic
+  edits no longer orphan tasks. The UI must still explain
+  the invalidation rather than show an empty list as if no
+  tasks exist; otherwise the user thinks the system
   silently dropped their work.
+- **Tasks UX is capability-conditional.** v12 does not
+  promise a global jobs panel against servers that do not
+  advertise `tasks.list`, and does not render cancel
+  controls against servers that do not advertise
+  `tasks.cancel`. App-affordance UX therefore varies by
+  server. Operator docs explain why; the chrome labels the
+  per-conversation handles view as such so users do not
+  expect cross-session recovery on capability-limited
+  servers.
 - **Remount is not state preservation.** The extended
   `mcp_app` artifact guarantees the view re-renders against
   the same approved bytes. It does **not** preserve internal
@@ -2403,8 +2736,11 @@ the cross-origin iframe layer.
   revalidation is **Phase 4**.
 - Per-user token scoping for shared server definitions.
 - `authContextHash` computed at connection time over normalized
-  effective auth configuration; immutable across the
-  connection's lifetime; changes invalidate task ownership.
+  effective auth-relevant configuration; immutable across the
+  connection's lifetime; auth-relevant changes invalidate task
+  ownership; **OAuth refresh does not change the hash**;
+  **non-auth config edits (display name, docs, fallback
+  height) do not change the hash** (v12 `authRevision`).
 - (Regression-only) 307/308 redirect handling and credential
   stripping on cross-origin redirects: spot-check that public
   `main` behavior has not regressed.
@@ -2458,13 +2794,22 @@ are listed twice.
 - **Iframe sandbox flag filter**: requested `allow-popups`,
   `allow-top-navigation`, `allow-forms`, `allow-same-origin`
   stripped at host before render.
-- **Self-contained-HTML validator**: HTML containing **any**
-  `<script src>` (relative or absolute), `<link href>`,
-  `<img src>` to a non-`data:` URL, `<iframe src>`,
-  `<object>`/`<embed>`, remote `<source>`/`<track>`/`<video>`/
-  `<audio>` URL, `<base>`, or remote ES `import`/dynamic
-  `import()` is rejected at review time. Inline `<script>` and
-  `<style>` are accepted; `data:` images are accepted.
+- **[H] Self-contained-HTML validator (Hardened)**: HTML
+  containing **any** `<script src>` (relative or absolute),
+  `<link href>`, `<img src>` to a non-`data:` URL,
+  `<iframe src>`, `<object>`/`<embed>`, remote
+  `<source>`/`<track>`/`<video>`/`<audio>` URL, `<base>`, or
+  remote ES `import`/dynamic `import()` is rejected at review
+  time. Inline `<script>` and `<style>` are accepted; `data:`
+  images are accepted.
+- **[P] Relative-external-URL rejection (Preview, v12)**:
+  HTML containing relative `<script src>`, `<link href>`,
+  `<img src>`, frame `src`, or `<base>` is rejected at
+  review time even in Preview, because under the unified
+  `srcdoc` topology relative URLs would resolve against
+  `MCP_SANDBOX_ORIGIN`. Absolute HTTPS URLs covered by
+  `_meta.ui.csp.resourceDomains` are still accepted in
+  Preview.
 - **One proxy iframe per app instance**: a conversation with N
   app messages renders N proxy iframes, not one shared proxy.
   Teardown of one instance does not affect siblings.
@@ -2559,6 +2904,10 @@ are listed twice.
   - View-bound `tool-result` over
     `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` is truncated
     with a marker; model-path serialization is unaffected.
+  - Live `tasks/result` envelope over
+    `MCP_TASKS_MAX_RESULT_FORWARD_BYTES` is truncated with
+    a marker on the model path and surfaces a chrome
+    warning on the view path; nothing is persisted.
   - `ui/resource-teardown` honored within
     `MCP_APPS_TEARDOWN_WAIT_MS`; otherwise iframe is
     force-removed.
@@ -2598,16 +2947,23 @@ are listed twice.
 - First-launch resource review: `manifestHash` stored;
   manifest divergence (HTML, sandbox, permissions, network
   policy, URI, or trust-policy version) refused at next
-  launch when `MCP_APPS_HASH_PINNING_REQUIRED=true` and
-  surfaces a notice + re-approval action when advisory.
+  launch when `MCP_APPS_HASH_PINNING_REQUIRED=true`. In
+  advisory (default) mode (v12) the host **auto-repins**
+  to the new manifest, renders, and surfaces a host
+  banner naming server, manifestHash short-prefix, and
+  what changed; there is no blocking re-acknowledge
+  click in advisory mode. Tests assert both modes.
 - **Data boundary — model path**: `structuredContent` and
   `_meta` never appear in model-bound serialization, including
-  across rehydration.
-- **Data boundary — view path**: `_meta` (including
+  across live `tasks/result` forwarding.
+- **Data boundary — view path** (Phase 1 / Preview gate,
+  v12): `_meta` (including
   `io.modelcontextprotocol/related-task` and server-defined
   keys outside the reserved namespace) is preserved on
   `ui/notifications/tool-result` to the view, and on
-  view-path `tasks/result` rehydration.
+  view-path live `tasks/result` forwarding. A regression
+  test fails if the inherited bridge drops `_meta`. This
+  is verified in Preview, not deferred to Hardened.
 
 ### MCP Tasks
 
@@ -2625,7 +2981,25 @@ are listed twice.
   receiver ignores meta, uses param.
 - **Cancellation after terminal status returns `-32602` invalid
   params**. UI disables the cancel button on terminal tasks.
-- Cursor pagination of `tasks/list` traverses correctly.
+- **Capability-conditional UX (v12)**:
+  - For a server advertising both `tasks.list` and
+    `tasks.cancel`: jobs panel renders cross-session view,
+    cancel button rendered (and disabled on terminal /
+    `input_required`).
+  - For a server advertising `tasks.list` but not
+    `tasks.cancel`: jobs panel renders, cancel button is
+    **not rendered** for that server's rows.
+  - For a server advertising `tasks.cancel` but not
+    `tasks.list`: cross-session global view does **not**
+    list that server's tasks; per-conversation handles
+    view shows them; cancel button rendered.
+  - For a server advertising neither: per-conversation
+    handles view only; no cancel control.
+  - Negotiated capabilities persist on `MCPTask` rows and
+    survive page reload.
+- Cursor pagination of `tasks/list` traverses correctly
+  for servers that advertise it; the test does **not** run
+  for servers that do not advertise `tasks.list`.
 - **Shared in-process poller**: when N subscribers (mounted
   view + jobs panel + chat tab) all subscribe to the same
   `(taskId, authContextHash)`, exactly **one** outbound
@@ -2653,17 +3027,36 @@ are listed twice.
   **not** trigger any `tasks/result`; the test asserts no
   such call is issued unless the user explicitly clicks
   detail or "wait for result".
-- **TTL-bounded cache**: a cached `tasks/result` row is served
-  only while `now < createdAt + ttl`; afterwards the cache
-  refuses and a fresh `tasks/result` is issued (which may
-  legitimately answer "task expired"). MongoDB TTL index
-  removes expired rows automatically.
+- **No host-side cache (v12)**: `tasks/result` is **not**
+  cached by the host. Every detail-entry / explicit-wait
+  click issues a live `tasks/result` against the server.
+  A test asserts the `MCPTask` row carries no terminal
+  envelope after termination, and that two consecutive
+  detail entries against the same terminal task issue two
+  `tasks/result` calls. Past `createdAt + ttl` the server
+  may legitimately answer "task expired"; the host
+  surfaces that without inventing a fallback. MongoDB TTL
+  index removes expired metadata rows automatically.
 - Disconnect during polling → subscriber resubscribes after
   reconnect via `tasks/list` + `tasks/get`.
 - HTTP 404 for `MCP-Session-Id` → new session,
   **outstanding-task revalidation** runs (Phase 4 work, not
   Phase 0): each known `taskId` is queried via `tasks/get` on
   the new session; "not found" becomes terminal-with-error.
+- **Wait-restart on session loss (v12)**: a blocking
+  `tasks/result` wait that fails with 404 / session-lost
+  triggers exactly **one** re-init + `tasks/get` + retry
+  cycle. Test cases:
+  - Non-terminal after re-init: one `tasks/get` then one
+    `tasks/result` retry; wait resumes.
+  - Terminal after re-init: one `tasks/get` then one
+    `tasks/result` that returns the terminal envelope.
+  - "Not found" after re-init: marked terminal-with-error
+    with a clear "task lost across re-init" message; no
+    retry.
+  - Second `tasks/result` failure: surfaced as failure;
+    no further retry, no silent fallback to polling, no
+    duplicate concurrent waiter.
 - `progressToken` propagates through bridge to active subscribers
   via in-memory mapping.
 - `model-immediate-response`: emitted as intermediate message;
@@ -2671,10 +3064,11 @@ are listed twice.
 - **`authContextHash` binding**: `tasks/list` from a
   different context returns empty; `tasks/get` for another
   context's task returns not-found. A test deliberately
-  mutates the underlying **identity** configuration
-  mid-flight (e.g. operator changes `configRevision`) and
-  verifies the hash changes and prior tasks become
-  invisible (with a UI message explaining the binding).
+  mutates the underlying **auth-relevant** configuration
+  mid-flight (e.g. operator bumps `authRevision` because
+  the OAuth issuer changed) and verifies the hash changes
+  and prior tasks become invisible (with a UI message
+  explaining the binding).
 - **`authContextHash` OAuth-refresh invariance**: a test
   refreshes the OAuth access token mid-flight (without
   changing `oauthSubject` or any other identity field) and
@@ -2682,19 +3076,29 @@ are listed twice.
   task is still visible / fetchable. This is the v11
   regression guard against the v10 shape that included
   live bearer-token bytes.
+- **`authContextHash` non-auth-edit invariance (v12)**: a
+  test mutates non-auth server config (display name,
+  description, icon, docs, default UI settings, fallback
+  height) without bumping `authRevision` and verifies
+  `authContextHash` is unchanged and prior tasks remain
+  visible / fetchable. This is the v12 regression guard
+  against the v11 `configRevision` shape that bumped on
+  every server-config edit.
 - **Shared in-process poller dedup**: with N subscribers
   on the same `(taskId, authContextHash)` in one process,
   exactly one outbound `tasks/get` is observed per
   `pollInterval`; all N receive fan-out updates.
   Cross-process dedup is **not** asserted (deliberately —
   it is a node-local contract; tests document the limit).
-- **`tasks/result` rehydration**: response is semantically
-  equivalent to the original request's — same envelope type
-  (result vs error), same parsed structure, `_meta` preserved
-  including `related-task`. Pointerized blob offloads rehydrated
-  back to inline shape (or original CallToolResult linkage)
-  before responding. Byte-for-byte serializer equality is not
-  asserted.
+- **`tasks/result` is forwarded live (v12)**: there is no
+  rehydration step. The host issues `tasks/result` against
+  the server on detail entry / explicit wait and forwards
+  the envelope to the requester. Tests assert: (a) the
+  response is the server's envelope verbatim on the view
+  path including `_meta` (with `related-task`); (b) the
+  model path strips `structuredContent` and `_meta`; (c)
+  no `MCPTask` row stores the envelope (cache-cut
+  invariant from v12).
 - **`input_required` runtime**:
   - Server transitions a task to `input_required`.
   - Host preserves `status: "input_required"` and sets
@@ -2715,11 +3119,11 @@ substrate.
 | Phase | Estimate |
 |---|---|
 | 0 — Transport reliability + auth-context (inherits `dev` fixes) | 2–4 days |
-| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology to `MCP_SANDBOX_ORIGIN` for both modes, vendor schemas, lazy bridge with budget, Hardened delta scaffolds, default-deny legacy renderer, live-chat narrowing, lazy remount | 1.5–2 weeks |
+| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology to `MCP_SANDBOX_ORIGIN` for both modes, hop-specific relay + proxy-stamped nonce + folded `ui/initialize` probe (Preview gate, v12), `_meta` passthrough verification (Preview gate, v12), vendor schemas, lazy bridge with budget, Hardened delta scaffolds, default-deny legacy renderer, live-chat narrowing, lazy remount | 2–2.5 weeks (v12 absorbs relay validation work from former Phase 2H) |
 | 2P — Apps Preview release (single-ACL refactor, truthful HostContext minimum subset, fullscreen gate, payload truncation, rate limits, capability turn-on) | 1–2 weeks |
-| 2H — Apps Hardened (policy-only delta on Phase 1's topology: hop-specific relay + nonce, folded init probe, manifest review, `mcp_app` artifact extension, full legacy retirement, `connect-src 'none'`, Wasm/eval exclusion, no fullscreen) | 2–2.5 weeks (separate release) |
+| 2H — Apps Hardened (policy-only delta on Phase 1's topology and relay validation: manifest review, `mcp_app` artifact extension, full legacy retirement, `connect-src 'none'`, Wasm/eval exclusion, no fullscreen) | 1.5–2 weeks (separate release; v12 — relay work moved to Phase 1) |
 | 3 — `tool-input-partial` (optional) | 1 week (risk) |
-| 4 — MCP Tasks v1 (status-only jobs panel; progress UI deferred to #12535 reuse) | ~2 weeks |
+| 4 — MCP Tasks v1 (capability-conditional status-only jobs panel; metadata-only storage with live `tasks/result`; wait-restart on session loss; progress UI deferred to #12535 reuse) | ~2 weeks |
 | 5 — Hardening + browser matrix + ops docs | 1 week |
 
 **Sequential release order: Apps Preview → Tasks v1 → Apps
@@ -2730,9 +3134,9 @@ user-visible synergy. Three releases is cleaner.
 
 | Release | Phases | Estimate (sequential) |
 |---|---|---|
-| **R1: Apps Preview (chat)** | 0 + 1 + 2P | **~3–4 weeks** |
-| **R2: Tasks v1 (status-first jobs panel; cancel; detail-fetch)** | 4 | **~2 weeks** after R1 |
-| **R3: Apps Hardened** (LibreChat Hardened App Profile) | 2H | **~2–2.5 weeks** after R2 |
+| **R1: Apps Preview (chat)** | 0 + 1 + 2P | **~3.5–4.5 weeks** (v12; Phase 1 absorbs relay validation) |
+| **R2: Tasks v1 (capability-conditional status-first jobs panel; cancel where supported; live detail fetch)** | 4 | **~2 weeks** after R1 |
+| **R3: Apps Hardened** (LibreChat Hardened App Profile) | 2H | **~1.5–2 weeks** after R2 (v12; relay work moved up) |
 
 If staffing allows independent tracks, Tasks (R2) can run in
 parallel with R1 because the only shared touchpoint is
