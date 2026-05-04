@@ -3,7 +3,7 @@
 This file is **revision history**, not implementation guidance.
 The current plan is in [`mcp-apps-and-tasks.md`](./mcp-apps-and-tasks.md).
 
-The plan went through thirteen revisions during scoping and
+The plan went through fourteen revisions during scoping and
 review, each in response to a specific gap or contradiction
 caught in review. Implementers should read the plan; this
 file is for reviewers, future maintainers, and anyone trying
@@ -21,9 +21,172 @@ to understand why a particular decision is the way it is.
 | v11 | Reality check | Unified outer-sandbox topology; #11799 is a local patchset; stable-identity `authContextHash`; lazy remount; multi-content `resources/read` accepted; vendor generated schemas |
 | v12 | Implementation prep | Preview compatibility clause; relay validation promoted to Phase 1; `_meta` passthrough as Preview gate; capability-conditional Tasks UX; `authRevision` replaces `configRevision`; host-side terminal-result cache cut entirely; auto-repin advisory pinning; deterministic wait-restart on session loss |
 | v13 | Delete the compatibility theater | One authoring profile across modes (no external assets, `connect-src 'none'` in both); blocking `tasks/result` waiter cut entirely (poller-based wait UI); `authContextHash` derives from a snapshot, not a counter; bootstrap trust is fail-closed; exactly-one-match `contents[]` rule; required text fallback contract; `model-immediate-response` is model plumbing only; vendor Tasks schemas; validator drops static JS inspection |
+| v14 | Wire it up correctly | Single bridge (SDK only); MCP capability profile marker so servers learn the profile at registration time; implicit wait-mode for model-started required tasks; `input_required` parks the poller; native navigation/forms/refresh blocked under sandbox + `srcdoc`; oversize results hard-fail on the view path; fullscreen stripped from v1 entirely; persistence keys off `mcpServerId`; derived `expiresAt` for MongoDB TTL; review console deferred post-v1 |
 
 Full per-revision narratives below; full earlier-revision
 narratives (v1–v5) are available in git history.
+
+---
+
+## v14 — Wire it up correctly
+
+A third external review confirmed the v13 simplifications were
+correct in spirit but caught two design mismatches and a pile
+of remaining contradictions that would have made the plan hard
+to implement without re-deciding things at the keyboard. v14
+fixes the design mismatches, unblocks model-started long-running
+tools (which v13 left without a path back into chat), tightens
+the Apps wire contract so server authors learn the host's
+profile at MCP capability negotiation rather than at review-time
+failure, and makes the host's behavior under `srcdoc` + sandbox
+explicit. v13's frozen decisions remain in force; v14 only
+adjusts where review found leftover ambiguity or design bugs.
+
+**v14 decisions (binding; supersede v13 where they conflict):**
+
+- **Single bridge, SDK only.** Upstream PR #11799 carries
+  both a custom `MCPAppBridge.ts` JSON-RPC bridge and an
+  optional adapter for the SDK-based `AppBridge` from
+  `@modelcontextprotocol/ext-apps`. v14 standardizes on
+  the SDK path and **deletes the custom bridge** in
+  Phase 1. The transport shim wraps the SDK with
+  explicit target origins and a proxy-stamped per-view
+  nonce; receive validation is the SDK's. This matches
+  the upstream Apps rationale of reusing MCP
+  infrastructure and removes a parallel test matrix.
+
+- **MCP capability profile marker.** v13 collapsed
+  Preview and Hardened to one authoring profile but did
+  not give servers a way to learn about that profile
+  during MCP capability negotiation. v14 advertises the
+  profile twice: once in the MCP initialize response
+  (`capabilities.experimental["io.modelcontextprotocol/ui"]
+  .profile = "librechat-self-contained"`) so server-side
+  tool registration can react before any tool with
+  `_meta.ui.resourceUri` is advertised, and once in
+  `ui/initialize` (`hostCapabilities.experimental.profile`)
+  so view code can branch. Servers that ignore the
+  marker still work but get text fallback for any tool
+  that registers with disallowed metadata.
+
+- **Implicit wait-mode for model-started required
+  tasks.** v13's "wait for result" UI mode lives on top
+  of the shared poller, but v13 left model-started
+  long-running tools without a path back into chat — a
+  user typing "submit my CAD job" would see the model
+  send the call and never receive the actual result
+  unless they manually opened the jobs panel. v14 makes
+  implicit wait the default for the originating turn
+  whenever the agent invokes a `taskSupport: "required"`
+  tool: the chat surface shows a waiting state, the
+  shared poller continues, and on the first terminal
+  status the host issues exactly one `tasks/result` and
+  delivers the envelope on both the model path and the
+  chat surface. Implicit wait does not apply to tasks
+  created from inside a mounted app view (those keep
+  status-only semantics) or to manually re-opened
+  detail rows on prior turns.
+
+- **`input_required` parks the poller.** The Tasks
+  spec says requestors should poll until terminal **or
+  until `input_required`**. v13 documented unsupported-
+  lifecycle chrome but did not specify what the shared
+  poller does. v14 makes parking explicit: on first
+  `input_required`, the shared poller stops issuing
+  `tasks/get` for that task; the UI surfaces the
+  unsupported-lifecycle state; cancel remains available
+  only when the server advertises `tasks.cancel`; a
+  user-triggered manual refresh issues exactly one
+  `tasks/get` and resumes parking on the same status.
+
+- **Native navigation, forms, and refresh redirects
+  are blocked.** Under `srcdoc` + the host's hardened
+  sandbox set, `<form>` renders but does not submit,
+  sandboxed frames block top-level navigation, and
+  relative URLs resolve against `MCP_SANDBOX_ORIGIN`.
+  v13's CSP defenses cover `connect-src` and
+  `form-action` but did not address native-navigation
+  surprises. v14 makes the contract explicit:
+  - The validator rejects `<form action>`, `<form
+    method>`, `<meta http-equiv="refresh">`,
+    `target="_blank"`, `target="_top"`, and anything
+    else that needs a sandbox flag the host refuses.
+  - The proxy injects an anchor click interceptor that
+    routes `<a href>` activations through `ui/open-link`
+    against the host's navigation allowlist.
+  - The runtime CSP defenses (`form-action 'none'`,
+    `base-uri 'none'`) remain.
+
+- **Oversize results hard-fail on the view path.** v13
+  carried v11/v12's "truncate with marker" rule for
+  view-bound `tool-result` payloads over the cap. The
+  Apps spec defines `ui/notifications/tool-result` as a
+  standard `CallToolResult`, and the Tasks spec says
+  terminal `tasks/result` MUST equal what the underlying
+  request would have returned — including correlation
+  metadata like `_meta["io.modelcontextprotocol/related-task"]`.
+  Lossy truncation breaks both contracts. v14 refuses
+  to deliver an oversize partial envelope to the view
+  and surfaces a host-chrome error instead. Model-path
+  truncation with a marker is unaffected on the model
+  path.
+
+- **Fullscreen stripped from v1.** v11/v13 still let
+  Preview honor `appSettings.allowFullscreen` and
+  expose `fullscreen` in `availableDisplayModes`. v14
+  cuts that for v1 entirely — both Preview and
+  Hardened advertise `availableDisplayModes =
+  ["inline"]` and reject any other requested mode —
+  because trust-chrome-under-fullscreen has not been
+  validated and the truthful-subset principle for
+  HostContext should not be mode-dependent. Fullscreen
+  is re-evaluated post-v1 with the trust-chrome
+  validation.
+
+- **Persistence keys off `mcpServerId`, never display
+  name.** v13 already treated display name as cosmetic
+  in the `authContextHash` derived snapshot but had not
+  tightened that rule across `MCPResourceReview`,
+  manifest-pinning records, the `mcp_app` artifact's
+  manifest binding, or the per-server task ownership
+  index. v14 uses the immutable `mcpServerId`
+  everywhere review, pinning, or task-ownership
+  persistence depends on a server identity, so renames
+  cannot drop approvals or collide records.
+
+- **Task TTL uses a derived `expiresAt` field with a
+  single-field MongoDB TTL index.** v12/v13
+  repeatedly described "MongoDB TTL index on `createdAt
+  + ttl`" — that is not how TTL indexes work. MongoDB
+  TTL indexes are single-field; you cannot index an
+  expression. v14 computes `expiresAt = createdAt +
+  ttl` at write time, stores it on `MCPTask`, and
+  indexes that field with `expireAfterSeconds: 0`.
+  Application reads check `now < expiresAt` directly
+  because the TTL monitor runs on a background cadence
+  and is not synchronous at the millisecond boundary.
+
+- **Operator-facing review console is post-v1.** The
+  Apps rationale supports host review of templates and
+  pinning of reviewed assets, but a fully-fledged admin
+  UI is not on the v1 release path. v14 ships
+  log-and-auto-allow plus pinning behavior (advisory
+  by default, hard refuse under
+  `MCP_APPS_HASH_PINNING_REQUIRED=true`); operators
+  read review activity from logs. A first-class admin
+  UI comes in a later release without changing
+  user-facing UX.
+
+- **Stale prose deleted.** v12/v13 still carried
+  contradictory paragraphs in places: Preview honoring
+  `connectDomains` or `resourceDomains`, Phase 1 exit
+  criterion saying the validator was "behind a flag,
+  not yet used in the Preview render path," manifest
+  divergence auto-repinning described as all-mode
+  while Preview lacked manifest review. v14 deletes
+  every leftover sentence that contradicts v13's
+  unified-profile decision so implementers do not have
+  to decide which paragraph is authoritative.
 
 ---
 

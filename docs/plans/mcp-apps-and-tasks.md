@@ -3,7 +3,7 @@
 **Status:** Draft / scoping document — no code in this PR.
 **Owner:** TBD
 **Target branch:** `claude/mcp-apps-spec-support-rEi7X`
-**Revision:** v13. See
+**Revision:** v14. See
 [`mcp-apps-and-tasks-changelog.md`](./mcp-apps-and-tasks-changelog.md)
 for the per-revision decision history. This file describes
 the current frozen state; implementers do not need to read
@@ -135,32 +135,28 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
   short-prefix, and what changed. There is **no** blocking
   re-acknowledge click. Hard refuse is reserved for
   `MCP_APPS_HASH_PINNING_REQUIRED=true` (strict pinning).
-- **[P]** **Preview compatibility clause** (v12). Once Phase 1
-  unifies both modes onto `srcdoc` under
-  `MCP_SANDBOX_ORIGIN`, two upstream-style behaviors are
-  no longer reliable in Preview and are explicitly cut:
-  - Relative external asset URLs (`<script src>`,
-    `<link href>`, `<img src>`, frame `src`) inside the
-    resource HTML are **rejected at review time** in Preview
-    as well as Hardened — they would resolve against
-    `MCP_SANDBOX_ORIGIN` under `srcdoc`, not against
-    `ui://`. Preview keeps `_meta.ui.csp.resourceDomains`
-    parsing for absolute HTTPS asset references but
-    rejects any relative `src`/`href`.
-  - Direct browser networking from the inner frame is
-    **best-effort, unsupported in production** in Preview.
-    The inner-frame origin is opaque (`null`), which
-    breaks cookies, conservative CORS, OAuth, and origin-
-    based API allowlists. `connectDomains` is honored in
-    the rendered CSP per upstream, but app authors are
-    documented to route through the bridge
-    (`tools/call` / `resources/read` / `ui/open-link`)
-    for anything that needs credentials, cookies, or a
-    stable browser-side identity.
-  - Preview is documented as a **non-portable authoring
-    mode**, not as a natural first step toward Hardened.
-    Apps targeting Hardened build to the Hardened profile
-    directly.
+- **[A]** **Native navigation, forms, and refresh redirects
+  are blocked under sandbox + `srcdoc` (v14).** The Apps
+  spec's CSP surface and the iframe sandbox attribute do
+  not cleanly cover native navigation under `about:srcdoc`:
+  forms render but do not submit; sandboxed frames block
+  top-level navigation by default; relative URLs resolve
+  against `MCP_SANDBOX_ORIGIN`. v14 makes the host's
+  behavior explicit:
+  - The validator rejects `<form action>`, `<form method>`,
+    `<meta http-equiv="refresh">`, `target="_blank"` /
+    `target="_top"` link attributes, and any other
+    declarative construct that needs a sandbox flag the
+    host refuses to grant.
+  - The proxy injects an anchor click interceptor: any
+    `<a href>` activation is captured before default
+    navigation and routed through `ui/open-link` against
+    the host navigation allowlist.
+  - The runtime CSP `form-action 'none'` and
+    `base-uri 'none'` defenses remain.
+  Without these rules, app authors get dead forms, dead
+  links, or inner-frame self-navigation surprises rather
+  than the host-controlled `ui/open-link` flow.
 - **[A]** Sequential release train: Apps Preview → Tasks v1 →
   Apps Hardened.
 - **[A]** Phase 1 pins a specific commit SHA on
@@ -219,22 +215,150 @@ Legend: **[P]** = applies when `MCP_APPS_MODE="preview"`.
   for that turn, and does not stage a separate "final
   result" message that overwrites the placeholder. Users
   see standard task-card chrome in the running-jobs UI.
+- **[T]** **Implicit wait-mode for model-started required
+  tasks (v14).** When the **agent** invokes a tool with
+  `taskSupport: "required"` during a chat turn, the host
+  defaults that originating turn into the same "wait for
+  result" UI state used by explicit waits: the shared
+  poller keeps running, the chat shows a waiting
+  indicator, and on the first terminal status the host
+  issues exactly one `tasks/result` and returns the
+  envelope on both the model path and the chat surface.
+  Without this default, model-started long-running tools
+  would terminate without the result ever reaching chat
+  unless the user manually opened the jobs panel — the
+  task spec puts the actual result behind `tasks/result`
+  and reduces the immediate response to a provisional
+  hint. Implicit wait does not apply to tasks created
+  from inside a mounted app view (those keep status-only
+  semantics in the panel) and does not apply to manually
+  re-opened detail rows on prior turns.
+- **[A]** **Single bridge: SDK `AppBridge` only (v14).**
+  Upstream PR #11799 carries both a custom JSON-RPC
+  bridge and an optional SDK-based `AppBridge` adapter
+  from `@modelcontextprotocol/ext-apps`. v14 standardizes
+  on the SDK path and **deletes the custom bridge** in
+  Phase 1. The transport shim (explicit target origins,
+  proxy-stamped per-view nonce on inbound) wraps the SDK
+  path; receive validation is the SDK's. Keeping both
+  bridges doubles the test matrix and guarantees drift;
+  deleting the custom bridge is on-thesis with the
+  upstream Apps rationale of reusing MCP infrastructure.
+- **[A]** **Oversize result on the view path is hard-fail,
+  not lossy truncation (v14).** Earlier revisions said
+  view-bound `tool-result` over
+  `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` would be
+  truncated with a marker and forwarded. The Apps spec
+  defines `ui/notifications/tool-result` as a standard
+  `CallToolResult`, and the Tasks spec says terminal
+  `tasks/result` MUST equal what the underlying request
+  would have returned — including correlation `_meta`
+  like `related-task`. Lossy truncation breaks both
+  contracts. v14 instead refuses to deliver an oversize
+  envelope to the view, surfaces a host-chrome error
+  ("The app sent a result that was too large to render
+  here. Server authors should return an artifact handle
+  or a follow-up resource instead."), and keeps the
+  model-path truncation marker as a model-side
+  concession. The view-bound path is contract-faithful
+  or it does not render.
+- **[A]** **MCP capability profile marker (v14).** The
+  host advertises the LibreChat single-authoring-profile
+  marker in two places at MCP capability negotiation:
+  - `capabilities.experimental["io.modelcontextprotocol/ui"].profile = "librechat-self-contained"`
+    (or operator-elected variant) inside the MCP
+    initialize response, so server-side tool registration
+    can react before any tool-with-app metadata is
+    advertised back to the host.
+  - `hostCapabilities.experimental.profile =
+    "librechat-self-contained"` inside `ui/initialize`
+    response, so view code that already has
+    `hostCapabilities` available can also branch.
+  Servers that explicitly opt in to the profile suppress
+  external-asset and `connectDomains` declarations at
+  registration time; servers that do not opt in still
+  work but get text fallback for any tool that declares
+  `_meta.ui.resourceUri` with disallowed metadata.
+  Without this marker, stable-conformant servers
+  register UI-enabled tools that look compatible and
+  then fail at review time for reasons they could not
+  predict.
+- **[A]** **Persistence keys off `mcpServerId`, never
+  display name (v14).** `MCPResourceReview`,
+  manifest-pinning records, the `mcp_app` artifact's
+  manifest binding, and any per-server task ownership
+  index key off the immutable `mcpServerId`. Display
+  name and other cosmetic fields are explicitly
+  non-auth-relevant per decision 4 / decision 18 and
+  must not appear in any persistence key, lest renames
+  drop approvals or collide records.
+- **[T]** **Task TTL uses a derived `expiresAt` field with
+  a single-field MongoDB TTL index (v14).** MongoDB TTL
+  indexes are single-field; you cannot index
+  `createdAt + ttl` as an expression. v14 computes
+  `expiresAt = createdAt + ttl` at write time, stores
+  it on the `MCPTask` row, and indexes that field with
+  `expireAfterSeconds: 0`. TTL deletion is performed by a
+  background monitor and is not instantaneous; UI and
+  tests must not assume hard expiry at the millisecond
+  boundary. Reads check `now < expiresAt` directly rather
+  than relying on the index for consistency at the read
+  edge.
+- **[T]** **`input_required` parks the poller (v14).**
+  When a task transitions to server-reported
+  `status: "input_required"`, the shared poller stops
+  issuing further `tasks/get` for that task. The UI
+  surfaces the unsupported-lifecycle chrome; cancel
+  remains available **only** when the server advertises
+  `tasks.cancel`; the poller does not resume on its own.
+  Manual refresh from the user re-issues a single
+  `tasks/get` and resumes parking on the same status.
+  The Tasks spec says requestors should poll until
+  terminal **or until `input_required`**; v14 honors
+  that termination condition explicitly.
+- **[A]** **Operator-facing review console is post-v1
+  (v14).** The Apps rationale supports host review of
+  templates and pinning of reviewed assets, but a
+  fully-fledged admin UI is not on the v1 release path.
+  v1 ships log-and-auto-allow plus pinning behavior
+  (advisory by default, hard refuse under
+  `MCP_APPS_HASH_PINNING_REQUIRED=true`); operators read
+  review activity from logs. A first-class admin UI
+  comes in a later release without changing user-facing
+  UX.
+- **[A]** **Display modes: `inline` only in v1 (v14).**
+  v1 advertises `availableDisplayModes = ["inline"]` in
+  both Preview and Hardened. Earlier revisions allowed
+  Preview to honor `appSettings.allowFullscreen` and
+  expose `fullscreen` in `availableDisplayModes`; v14
+  cuts that until trust-chrome-under-fullscreen is
+  validated, so the truthful-subset principle for
+  HostContext is consistent across modes. Fullscreen is
+  re-evaluated post-v1 with the trust-chrome validation.
 
 ## Goal
 
 Bring LibreChat to a useful, conformant subset of the MCP extensions for
 interactive UIs (**MCP Apps**, SEP-1865, stable 2026-01-26) and long-running
-operations (**MCP Tasks**, 2025-11-25, experimental). v13 collapses Apps
-Preview and Apps Hardened to a **single authoring profile** (self-contained
-HTML, no external assets, bridge-routed networking) and lets the modes
-differ only on **operator-gated policy strictness** (Wasm/eval permitted
-in Preview, blocked in Hardened; fullscreen optional in Preview, stripped
-in Hardened; legacy renderer retired on chat in Preview, retired across
-all surfaces in Hardened; manifestHash review applied in Hardened).
-Apps Hardened remains a stricter **LibreChat Hardened App Profile**,
-**not** stable-spec parity (see decision 22). Tasks v1 is a deliberately
-narrow, capability-conditional, polling-only subset — there is no
-blocking `tasks/result` waiter in v1 (decision 30 in v13).
+operations (**MCP Tasks**, 2025-11-25, experimental). v13 collapsed Apps
+Preview and Apps Hardened to a **single authoring profile**
+(self-contained HTML, no external assets, bridge-routed networking).
+v14 extends that profile with an explicit wire-level marker (so servers
+learn the profile during MCP capability negotiation, not at review-time
+failure), makes the host's behavior under sandbox + `srcdoc` explicit
+(no native navigation, no native forms, no native refresh redirects;
+anchors are intercepted and routed through `ui/open-link`), strips
+fullscreen from v1 entirely (truthful `availableDisplayModes` =
+`["inline"]` in both modes), and tightens persistence keys to
+`mcpServerId` rather than display name. v14 also closes a Tasks UX
+hole: model-started `taskSupport: "required"` calls default to
+**implicit wait-mode** for the originating turn, so a normal chat tool
+that takes minutes still yields its result in chat without forcing the
+user to open the jobs panel. Apps Hardened remains a stricter
+**LibreChat Hardened App Profile**, not stable-spec parity (decision
+22). Tasks v1 is a deliberately narrow, capability-conditional,
+polling-only subset — there is no blocking `tasks/result` waiter
+(decision 30, v13).
 
 ## Closed go/no-go decisions
 
@@ -405,8 +529,8 @@ blocking `tasks/result` waiter in v1 (decision 30 in v13).
       - `"preview"`: adopts upstream PR #11799 substantially
         as-is (per-instance chat rendering, `mcp_app`
         artifacts, backend proxies, branch-native config).
-        Inline plus optional fullscreen behind
-        `appSettings.allowFullscreen`.
+        **Inline only** in v1 (v14 strips fullscreen
+        entirely; see decision 21 / displayMode rule).
       - `"hardened"`: turns on the v8 security delta on top
         of `"preview"`. Adds dedicated `MCP_SANDBOX_ORIGIN`,
         hop-specific relay validation with proxy-stamped
@@ -574,17 +698,20 @@ blocking `tasks/result` waiter in v1 (decision 30 in v13).
     any other non-chat surface fall back to text. The
     surface narrowing is enforced in code regardless of
     mode (when mode is not `"disabled"`).
-21. **Fullscreen accepted in Preview behind operator
-    gate.** Upstream #11799 already implements
-    `appSettings.allowFullscreen` and the fullscreen
-    portal. Preview keeps this code; fullscreen is OFF by
-    default per server. **Hardened v1 strips fullscreen**
-    until trust-chrome rules under fullscreen have been
-    re-validated (mandatory border + identity chrome must
-    remain visible across the OS-level fullscreen
-    transition; that test is post-v1). Hardened v1 honors
-    only `inline`. Other display modes (`pip`, etc.)
-    remain out of scope across both modes.
+21. **Display modes: `inline` only in v1 (v14).** Both
+    Preview and Hardened advertise
+    `availableDisplayModes = ["inline"]` and reject any
+    `ui/request-display-mode` request other than `inline`.
+    Earlier revisions allowed Preview to honor
+    `appSettings.allowFullscreen` and expose `fullscreen`
+    in the upstream code path; v14 cuts that for v1
+    because trust-chrome-under-fullscreen has not been
+    validated and the truthful-subset principle for
+    HostContext should not be mode-dependent. Other
+    display modes (`pip`, etc.) remain out of scope.
+    Fullscreen is re-evaluated post-v1 with the
+    trust-chrome-under-fullscreen validation, at which
+    point a future operator gate may re-introduce it.
 22. **Hardened is documented as the LibreChat Hardened App
     Profile, not as stable spec parity.** Operator docs
     enumerate each stable Apps surface field
@@ -658,8 +785,9 @@ blocking `tasks/result` waiter in v1 (decision 30 in v13).
     There is no blob offload, no semantic-rehydration
     persistence, no original-request-envelope persistence,
     no durable subscriber registry, no progress
-    checkpointing. The MongoDB TTL index on
-    `createdAt + ttl` removes stale metadata
+    checkpointing. The MongoDB TTL index on the
+    derived `expiresAt = createdAt + ttl` field (v14)
+    removes stale metadata
     automatically. Server-reported `tasks.list` /
     `tasks.cancel` capabilities are persisted on the row
     so capability-conditional UX survives reconnect.
@@ -1313,7 +1441,7 @@ Phase 2H (Hardened GA Apps), and Phase 4 (Tasks).
 | `ui://` URI validation for forwarded `resources/read` | **Inherited from #11799 (Phase 2P)** | upstream branch |
 | Capability advertising disabled when `mcpSettings.apps` off | **Inherited from #11799 (Phase 2P)** | upstream branch |
 | `stableMCPAppRef` for parent-re-render survival | **Inherited from #11799 (Phase 2P)** | upstream branch |
-| `appSettings.allowFullscreen` + fullscreen portal | **Inherited from #11799 (Phase 2P)**, OFF by default per server | upstream branch |
+| `appSettings.allowFullscreen` + fullscreen portal | **Stripped in v1 (v14)** — both Preview and Hardened reject `fullscreen` mode; the upstream portal code remains tree-shake-unreachable | upstream branch (disabled) |
 | Apps test server scaffold | **Inherited from #11799** | upstream branch |
 | Apps Preview capability negotiation (gated by `MCP_APPS_MODE="preview"`) | Phase 2P | — |
 | Live-chat-only narrowing (text fallback on share/search/plugin) | Phase 2P | client surfaces |
@@ -1665,6 +1793,13 @@ HTML and **rejects** any of these declarative constructs:
 - `<iframe src=…>`, `<frame src=…>`, `<embed>`, `<object>`,
   `<source>`, `<track>`, `<video>`, `<audio>` with remote `src`.
 - `<base href=…>` tags (avoid retargeting relative resolution).
+- (v14 native-navigation rules) `<form action=…>`,
+  `<form method=…>`, `<meta http-equiv="refresh">`,
+  `target="_blank"` / `target="_top"` link attributes,
+  and any other declarative construct that needs a sandbox
+  flag the host refuses to grant. Forms render but do not
+  submit under the host sandbox set; refusing them at
+  review time is more honest than a silently-broken form.
 
 What the resource **may** include:
 
@@ -1726,6 +1861,33 @@ external to resolve.
   origin is in the navigation allowlist. The user's browser handles
   the download.
 - `ui/download-file` is out of v1.
+- **Anchor click interceptor (v14).** The proxy installs a
+  capture-phase click handler on the inner iframe's
+  document that prevents the default action for any
+  `<a href>` activation and forwards the URL to the host
+  via the bridge as `ui/open-link`. The host applies the
+  navigation allowlist; allowed URLs open in a new
+  top-level browsing context (host UI, not iframe);
+  disallowed URLs surface a user-facing chrome message.
+  The interceptor is necessary because:
+  - Sandboxed frames block top-level navigation by default
+    without `allow-top-navigation`, so a vanilla `<a>`
+    click would either fail silently or land somewhere
+    unexpected.
+  - Relative anchors under `srcdoc` resolve against
+    `MCP_SANDBOX_ORIGIN`, not against `ui://`, so even
+    same-origin-style anchor patterns from the app would
+    misbehave.
+  - The host wants `ui/open-link` to be the single
+    navigation escape hatch (decision A: iframe sandbox
+    hardened defaults; `ui/open-link` is the only
+    navigation escape hatch).
+- The interceptor is paired with the validator's
+  `target="_blank"` / `target="_top"` rejection. The
+  validator stops the obviously-broken construct at
+  review time; the interceptor stops the runtime case
+  where the page's JavaScript builds anchors
+  programmatically.
 
 ### Sizing and `containerDimensions`
 
@@ -1779,12 +1941,13 @@ clear, operator-loggable error.
 5. **Manifest construction.** Build the canonical
    `MCPAppLaunchManifest` from decoded HTML, host-filtered
    sandbox flags, effective `allow` permissions, effective
-   network policy (always `connect-src 'none'` in Hardened,
-   `connectDomains`-derived in Preview), `resourceUri`, and
-   host trust-policy version.
+   network policy (always `connect-src 'none'` — same in
+   Preview and Hardened per v13 / v14 unified profile),
+   `resourceUri`, and host trust-policy version.
 6. **`manifestHash`** is `sha256(canonicalJSON(manifest))`
    (RFC 8785 JCS-equivalent). The hash is recorded in
-   `MCPResourceReview.manifestHash` (per-server) and on the
+   `MCPResourceReview.manifestHash` (keyed by
+   `mcpServerId`, never display name — v14) and on the
    `mcp_app` message artifact (per-launch); there is no
    separate `MCPAppInstance` collection.
 
@@ -1801,7 +1964,7 @@ safety.
 | Setting | Default | What it bounds |
 |---|---|---|
 | `MCP_APPS_MAX_HTML_BYTES` | 2 MiB | Maximum decoded HTML accepted at review |
-| `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` | 8 MiB | Maximum view-bound `tool-result` payload (truncated with marker over the limit) |
+| `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` | 8 MiB | Maximum view-bound `tool-result` payload (v14: hard-fail on the view path with a host-chrome error; never lossy-truncated to the view, since `ui/notifications/tool-result` and `tasks/result` are contractually full envelopes) |
 | `MCP_APPS_TEARDOWN_WAIT_MS` | 1500 | Time to wait for `ui/resource-teardown` response before forcing iframe removal |
 | `MCP_APPS_INITIALIZE_TIMEOUT_MS` | 5000 | Deadline for the first relayed `ui/initialize` to complete the (folded-in) probe |
 | `MCP_APPS_VIEW_RPC_RATE_PER_MIN` | 600 | Inbound JSON-RPC requests per view per minute before throttling/pause |
@@ -1950,10 +2113,13 @@ appear in view-bound serialization when the server provided them.
   `_meta.ui.resourceUri` is invoked, the host runs the full
   decoding pipeline (see "Content decoding and MIME validation"),
   builds the launch manifest, computes `manifestHash`, and
-  stores `(serverName, resourceUri, manifestHash, manifest,
-  firstSeen, authContextHashSeen)` in `MCPResourceReview`.
-  Operator policy decides auto-allow vs manual-review. Until
-  approved, the tool falls back to text-only.
+  stores `(mcpServerId, resourceUri, manifestHash, manifest,
+  firstSeen, authContextHashSeen)` in `MCPResourceReview`
+  (v14: keyed by the immutable `mcpServerId`, never the
+  display `serverName`). Operator policy decides auto-allow
+  vs manual-review. Until approved, the tool falls back to
+  text-only. v14 makes this log-and-auto-allow by default
+  in v1; the operator-facing review console is post-v1.
 - **Manifest pinning is required when configured, advisory by
   default.** Operators may set
   `MCP_APPS_HASH_PINNING_REQUIRED=true`, in which case any
@@ -2374,8 +2540,14 @@ Phase 1 exit criteria:
 6. Manifest hasher is deterministic across reorderings and
    matches fixture vectors byte-for-byte.
 7. Self-contained-HTML validator rejects every external-asset
-   construct in the test corpus (live behind a flag, not yet
-   used in the Preview render path).
+   construct in the test corpus and is **active on the Preview
+   render path** (v14 — the unified authoring profile applies
+   in both modes from Phase 1). The validator additionally
+   rejects `<form action>`, `<form method>`,
+   `<meta http-equiv="refresh">`, and `target="_blank"`/
+   `target="_top"` link attributes (v14 native-navigation
+   rule). The proxy's anchor click interceptor routes
+   allowed `<a href>` activations through `ui/open-link`.
 8. `authContextHash` unit tests pass against fixture
    configs: OAuth-refresh invariance, cosmetic-edit
    invariance, and auth-relevant-edit sensitivity (v13
@@ -2443,13 +2615,13 @@ Phase 1 exit criteria:
 ### Phase 2P — Apps Preview release (≈1–1.5 weeks)
 
 End of phase: Apps capability advertised when
-`MCP_APPS_MODE="preview"`; live-chat-only Apps render inline
-(and optionally fullscreen behind operator gate) under the
-**unified authoring profile** (self-contained HTML, no
-external assets, `connect-src 'none'`); Wasm/eval permitted
-in Preview's CSP; legacy renderer still serves
-share/search/plugin surfaces; manifestHash review and full
-legacy retirement remain Hardened-only.
+`MCP_APPS_MODE="preview"`; live-chat-only Apps render
+**inline only** under the **unified authoring profile**
+(self-contained HTML, no external assets, `connect-src
+'none'`); Wasm/eval permitted in Preview's CSP;
+fullscreen disabled in v1 (decision 21); legacy renderer
+still serves share/search/plugin surfaces; manifestHash
+review and full legacy retirement remain Hardened-only.
 
 (v13 estimate is shorter than v12 because the asset
 validator and `connect-src 'none'` policy moved into Phase 1
@@ -2458,8 +2630,18 @@ visibility/HostContext/rate-limit work and turns on
 capability advertisement.)
 
 - Live-chat path adopts upstream PR #11799's
-  `MCPAppContainer`, `MCPAppBridge`, and backend proxies as
-  the rendering substrate.
+  `MCPAppContainer` and backend proxies as the rendering
+  substrate. The bridge layer is **standardized on the
+  SDK-based `AppBridge`** from
+  `@modelcontextprotocol/ext-apps` (v14); the upstream
+  custom `MCPAppBridge.ts` JSON-RPC bridge is **removed
+  in Phase 1**. The transport shim wraps the SDK path
+  with explicit target origins, the proxy-stamped
+  per-view nonce on inbound, and the SDK's receive-side
+  envelope validation. Keeping both bridges doubles the
+  test matrix and guarantees drift; the v14 single-bridge
+  decision matches the upstream Apps rationale of reusing
+  MCP infrastructure.
 - **Single-ACL `forwardMcpRequestFromView` consolidation
   refactor.** Same-server binding already exists in #11799 via
   the per-instance `serverName`; Phase 2P consolidates the
@@ -2474,21 +2656,22 @@ capability advertisement.)
   - `ui/message` — `role: "user"` only; consent in host chrome;
     non-`user` rejected with clear error.
   - `ui/request-display-mode` — returns the actually-resulting
-    mode; `inline` and (when `appSettings.allowFullscreen`)
-    `fullscreen` honored.
+    mode; only `inline` is honored in v1 (v14). Any
+    other requested mode is rejected with a clear
+    error.
   - `ui/update-model-context` — overwrite semantics.
 - Host-side notifications: `tool-input`, `tool-result`,
   `tool-cancelled`, `host-context-changed`, `size-changed`,
   `ui/resource-teardown`.
 - **Truthful HostContext (minimum subset).** Preview
-  populates exactly: `displayMode`, `availableDisplayModes`
-  (includes `fullscreen` only when
-  `appSettings.allowFullscreen`), `containerDimensions`,
-  `toolInfo`, `theme`, `locale`, `timeZone`. CSS-variable
-  catalogs, safe-area insets, deep device-capability
-  surfaces, and platform richness are **not** synthesized
-  in v1; they are added later when a real app needs them.
-  Truthful subset, not synthetic full surface.
+  populates exactly: `displayMode = "inline"`,
+  `availableDisplayModes = ["inline"]` (v14 strips
+  fullscreen), `containerDimensions`, `toolInfo`, `theme`,
+  `locale`, `timeZone`. CSS-variable catalogs, safe-area
+  insets, deep device-capability surfaces, and platform
+  richness are **not** synthesized in v1; they are added
+  later when a real app needs them. Truthful subset, not
+  synthetic full surface.
 - `host-context-changed` notifications on theme / locale /
   dimension changes.
 - **Two helpers** for the data boundary (`toModelView`,
@@ -2496,9 +2679,12 @@ capability advertisement.)
   `structuredContent`/`_meta` never leak to the model path,
   and `_meta` (including `io.modelcontextprotocol/related-task`
   and server-defined keys) is preserved on the view path.
-- **View-bound payload truncation** at
-  `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` with a clear
-  marker.
+- **View-bound oversize is hard-fail (v14)**. View-bound
+  results over `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW`
+  refuse to render and surface a host-chrome error;
+  the view is not given a truncated envelope. Model-path
+  truncation continues to apply with a marker as the
+  model-side concession.
 - **Sizing fallback** alongside upstream `maxHeight`:
   `MCP_APPS_FALLBACK_HEIGHT_PX` until the first non-zero
   `size-changed`; `shrinkWrap: false` per-server opt-out.
@@ -2548,12 +2734,13 @@ delta is policy-only.)
   `manifestHash`, normalized manifest summary, timestamps,
   and just enough metadata to explain why a re-ack is
   required.
-- **Policy delta — `connect-src 'none'`.** The CSP injector
-  ignores `connectDomains` entirely in Hardened. Inner-view
-  network traffic is impossible. App authors route via
-  `tools/call` / `resources/read` / `ui/open-link`. The
-  upstream `applyAppSettingsToResult` path is retained for
-  Preview but bypassed in Hardened.
+- (Note: `connect-src 'none'` already lands in Phase 1
+  for both modes per v13 / v14, so it is **not** a
+  Phase 2H delta. The Hardened-specific `connect-src`
+  delta from v11 has been absorbed into the Phase 1
+  unified authoring profile. This entry is intentionally
+  retained as a no-op marker so reviewers tracking the
+  v11 delta know it has moved up.)
 - **Policy delta — Wasm + eval exclusion.** CSP omits
   `wasm-unsafe-eval` and `'unsafe-eval'`. Browser blocks
   `WebAssembly.instantiate(...)`, `eval(...)`, and
@@ -2646,6 +2833,42 @@ for implemented directions.
     duality, and no dedicated wait-restart state machine
     on session loss — re-init during polling uses the
     standard outstanding-task revalidation path.
+  - **Implicit wait-mode for model-started required tasks
+    (v14).** When the agent invokes a tool with
+    `taskSupport: "required"` during a chat turn, the
+    host defaults the originating turn into the same
+    "wait for result" UI state described above. The
+    chat surface shows a waiting indicator, the shared
+    poller continues at `pollInterval`, and on the first
+    terminal status the host issues exactly one
+    `tasks/result` and returns the envelope on both the
+    model path (truncated with marker if oversize) and
+    the chat surface (hard-fail with chrome error if
+    oversize, per v14 view-path rule). Implicit wait
+    does **not** apply to tasks created from inside a
+    mounted app view (those keep status-only semantics
+    and the view receives `tool-result` directly when
+    terminal); does **not** apply to manually re-opened
+    detail rows on prior turns. Without this rule, a
+    model-started long-running tool would terminate
+    server-side without the result ever reaching chat
+    unless the user manually clicked detail.
+  - **`input_required` parks the poller (v14).** When
+    a task transitions to server-reported
+    `status: "input_required"`, the shared poller stops
+    issuing further `tasks/get` for that task. The UI
+    surfaces the unsupported-lifecycle chrome (decision
+    26); cancel remains available **only** when the
+    server advertises `tasks.cancel` (decision 29). The
+    user can manually refresh, which issues a single
+    `tasks/get`; if the server is still in
+    `input_required`, parking resumes. The Tasks spec
+    says requestors should poll until terminal **or
+    until `input_required`**, so parking is the correct
+    termination condition; v1 does not synthesize an
+    `tasks/result` call against an `input_required`
+    task because LibreChat cannot satisfy elicitation
+    or sampling.
   - **Subscriber registry is in-memory per connected session.**
     On reconnect, subscribers re-register and reload from
     `tasks/get` via the shared poller. No durable subscriber
@@ -2659,10 +2882,15 @@ for implemented directions.
     correlationConversationId, serverTasksCapabilities)`.
     There is **no** cached terminal response/error
     envelope; on detail entry or explicit wait the host
-    calls `tasks/result` **live** every time. The MongoDB
-    TTL index on `createdAt + ttl` removes stale metadata
-    rows automatically. **No** request-envelope
-    persistence, **no** blob offload, **no**
+    calls `tasks/result` **live** every time. The
+    derived `expiresAt = createdAt + ttl` field (v14) is
+    written at task creation; a single-field MongoDB TTL
+    index on `expiresAt` (`expireAfterSeconds: 0`)
+    removes stale metadata rows on the background
+    monitor's cadence. Application reads check
+    `now < expiresAt` directly to avoid race-edge
+    inconsistency. **No** request-envelope persistence,
+    **no** blob offload, **no**
     semantic-equivalence rehydration, **no** durable
     subscriber state, **no** progress checkpointing.
     `serverTasksCapabilities` records the negotiated
@@ -2879,11 +3107,26 @@ to instantiate.
 5. The view calls `cad.submit_job(...)`
    (`taskSupport: required`, ~30 min). Server returns a task
    handle plus a `model-immediate-response` like "Job submitted,
-   ID 12345 — results in ~30 minutes". The agent feeds that
-   string into the model as the immediate tool result for the
-   call (v13 — model plumbing only); the user sees a standard
-   task card in the running-jobs UI, not a separate assistant
-   placeholder turn.
+   ID 12345 — results in ~30 minutes". Because this call was
+   issued from inside a mounted app view (not from the agent
+   on a chat turn), v14's implicit-wait default does **not**
+   apply; the view receives standard `tool-result`
+   notifications when the task terminates and updates its
+   own UI accordingly. The `model-immediate-response` is
+   fed into the model as the immediate tool result for the
+   call (v13 — model plumbing only); the user sees a
+   standard task card in the running-jobs UI, not a
+   separate assistant placeholder turn.
+
+   (Contrast: if the same `cad.submit_job` had been
+   invoked by the model in a normal chat turn — for
+   example, the user wrote "submit my CAD job for me" —
+   v14's implicit wait-mode default would put the chat
+   turn into a waiting state and the host would issue
+   one `tasks/result` on the first terminal status,
+   returning the envelope on the chat surface. The
+   in-app path here keeps the user in the app view
+   instead.)
 6. The view transitions to a "job status" panel — same `ui://`
    resource. While mounted, the panel polls. After the user
    closes the chat, polling stops; the task continues
@@ -3059,6 +3302,49 @@ to instantiate.
   future use case demands sub-`pollInterval` wait latency,
   a blocking waiter can be added behind a flag with its
   own restart contract.
+- **Implicit wait-mode for model-started required tasks
+  (v14).** Without this default, model-started long-
+  running tools terminate without their result reaching
+  chat unless the user manually opens detail or wait.
+  v14 makes implicit wait the chat-turn default; risk:
+  if `pollInterval` is large, the chat surface can sit
+  in a waiting state for a while. Operator docs explain
+  the trade and the `pollInterval` floor; user-facing
+  chrome makes the wait state visible (status badge,
+  optional cancel where supported).
+- **MCP capability profile marker (v14).** Servers that
+  ignore the marker and continue to register tools with
+  external-asset or `connectDomains` metadata still get
+  text fallback at review time, but the failure point
+  is later than ideal. Operator docs explain the marker
+  and its semantics; the host logs every tool that hits
+  text fallback because of disallowed metadata so server
+  authors can find and fix their registrations.
+- **Native-navigation behavior under sandbox + `srcdoc`
+  (v14).** Apps that try to use `<form>` for submission,
+  `<meta http-equiv="refresh">` for redirects, or
+  `target="_blank"` anchors will be rejected at review
+  time. Apps that try to use `window.location =` or
+  programmatically constructed anchors are caught by
+  the proxy's anchor click interceptor at runtime.
+  Operator docs spell out the supported navigation
+  surface (`ui/open-link` only).
+- **Lossy truncation has been removed from the view path
+  (v14).** Apps and Tasks specs both define the view-
+  bound payload as a contract-faithful envelope; v14
+  refuses to deliver an oversize partial envelope rather
+  than break that contract. Risk: a server that
+  consistently exceeds the cap will see its app fail
+  to render. Mitigation: the host-chrome error names
+  the cap and suggests artifact-handle or follow-up-
+  resource patterns the worked example demonstrates.
+- **TTL deletion is approximate (v14).** v14 fixes the
+  v12/v13 misuse of MongoDB TTL indexes by deriving
+  `expiresAt` and using a single-field index, but TTL
+  deletion is performed by a background monitor on its
+  own cadence. UI and tests must check `now < expiresAt`
+  directly rather than rely on the monitor for read-
+  edge consistency.
 - **`authContextHash` is now a derived snapshot (v13).**
   The ownership invariant is structural — auth-relevant
   config edits change the hash; cosmetic edits do not.
@@ -3228,6 +3514,40 @@ are listed twice.
   explicitly setting `connectDomains` does **not** install
   any `connect-src` origin in the rendered CSP — the
   field is parsed but ignored in both modes.
+- **[A] MCP capability profile marker (v14)**: at MCP
+  initialize, the host advertises
+  `capabilities.experimental["io.modelcontextprotocol/ui"].profile
+  = "librechat-self-contained"` (or operator-elected
+  variant). At `ui/initialize`, the host advertises
+  `hostCapabilities.experimental.profile` to the same
+  value. A fixture server reads the marker at MCP init
+  and suppresses `connectDomains` / `resourceDomains` in
+  its tool registrations; a second fixture server
+  ignores the marker and registers a tool with
+  `connectDomains` set, and the host falls back to text
+  for that tool with a clear chrome message.
+- **[A] Anchor click interceptor + form rejection (v14)**:
+  - Validator rejects HTML containing `<form action>`,
+    `<form method>`, `<meta http-equiv="refresh">`,
+    `target="_blank"`, or `target="_top"`.
+  - Runtime: a fixture page with a programmatically
+    constructed `<a href="https://example.com">` triggers
+    the proxy's anchor click interceptor; the URL is
+    forwarded to the host as `ui/open-link`; the host
+    applies the navigation allowlist; the inner iframe
+    does not navigate.
+  - Runtime: a fixture page that calls
+    `window.location = "https://attacker.example"` is
+    blocked because the inner sandbox set excludes
+    `allow-top-navigation` and the inner iframe is the
+    only navigable frame.
+- **[A] Hard-fail oversize on view path (v14)**: a
+  fixture tool that returns a >8 MiB
+  `CallToolResult.content` causes the host to refuse
+  rendering on the view path and surface a chrome
+  error; no truncated envelope reaches the view. The
+  same test asserts the model path receives a
+  truncate-with-marker version (model-side concession).
 - **[H] Wasm exclusion (Hardened)**: a fixture page that
   calls `WebAssembly.instantiate(...)` is rejected by the
   CSP at runtime (`script-src 'unsafe-inline'` without
@@ -3284,12 +3604,19 @@ are listed twice.
   - HTML over `MCP_APPS_MAX_HTML_BYTES` is rejected at
     review.
   - View-bound `tool-result` over
-    `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` is truncated
-    with a marker; model-path serialization is unaffected.
+    `MCP_APPS_MAX_TOOL_RESULT_BYTES_TO_VIEW` **hard-fails
+    on the view path** (v14): the host refuses to deliver
+    a partial envelope, surfaces a chrome error
+    (suggesting an artifact handle or follow-up
+    resource), and logs the decision. Model-path
+    truncation with a marker is unaffected on the model
+    path.
   - Live `tasks/result` envelope over
     `MCP_TASKS_MAX_RESULT_FORWARD_BYTES` is truncated with
-    a marker on the model path and surfaces a chrome
-    warning on the view path; nothing is persisted.
+    a marker on the model path; on the view path it
+    **hard-fails the render** (v14) with the same chrome
+    message as oversize `tool-result`. Nothing is
+    persisted on either path (no cache in v12+).
   - `ui/resource-teardown` honored within
     `MCP_APPS_TEARDOWN_WAIT_MS`; otherwise iframe is
     force-removed.
@@ -3448,6 +3775,38 @@ are listed twice.
   is active and that the terminal-trigger fetch happens
   exactly once. Latency: at most one `pollInterval` of
   additional completion delay.
+- **Implicit wait-mode for model-started required tasks
+  (v14)**: when the agent invokes a `taskSupport:
+  "required"` tool during a chat turn, the originating
+  turn enters wait-mode automatically; on terminal status
+  exactly one `tasks/result` is issued and the envelope
+  is delivered to both the model path (truncated marker
+  if oversize) and the chat surface (hard-fail with
+  chrome message if oversize). Tests cover: (a) terminal
+  arrives during the same turn — result lands in chat;
+  (b) terminal arrives after the turn closes — result
+  still lands as a follow-up message correlated to the
+  originating tool call; (c) view-mounted invocations of
+  the same tool do **not** trigger implicit wait — the
+  view receives `tool-result` directly.
+- **`input_required` parks the poller (v14)**: a fixture
+  task that transitions to `input_required` causes the
+  shared poller to **stop** issuing further `tasks/get`.
+  The unsupported-lifecycle chrome renders. Cancel is
+  available only when the server advertises
+  `tasks.cancel`. A user-triggered manual refresh issues
+  exactly one `tasks/get`; if status is still
+  `input_required`, the poller does not resume.
+- **Derived `expiresAt` TTL (v14)**: `MCPTask` documents
+  carry a derived `expiresAt = createdAt + ttl` field.
+  A single-field MongoDB TTL index on `expiresAt` is
+  configured with `expireAfterSeconds: 0`. Tests assert
+  (a) the derived field is computed at write time and
+  matches `createdAt + ttl`; (b) application reads check
+  `now < expiresAt` directly (no reliance on TTL
+  monitor for read-time consistency); (c) the TTL
+  monitor eventually deletes expired rows but does not
+  do so synchronously at the millisecond boundary.
 - **No opportunistic save**: a subscribed task that
   transitions to terminal while the user is present does
   **not** trigger any `tasks/result`; the test asserts no
@@ -3461,8 +3820,12 @@ are listed twice.
   detail entries against the same terminal task issue two
   `tasks/result` calls. Past `createdAt + ttl` the server
   may legitimately answer "task expired"; the host
-  surfaces that without inventing a fallback. MongoDB TTL
-  index removes expired metadata rows automatically.
+  surfaces that without inventing a fallback. The
+  derived `expiresAt` single-field TTL index (v14)
+  removes expired metadata rows on the background
+  monitor's cadence; application reads check
+  `now < expiresAt` directly because the monitor is not
+  synchronous.
 - Disconnect during polling → subscriber resubscribes after
   reconnect via `tasks/list` + `tasks/get`.
 - HTTP 404 for `MCP-Session-Id` → new session,
@@ -3535,14 +3898,21 @@ are listed twice.
   model path strips `structuredContent` and `_meta`; (c)
   no `MCPTask` row stores the envelope (cache-cut
   invariant from v12).
-- **`input_required` runtime**:
+- **`input_required` runtime (v14 parking)**:
   - Server transitions a task to `input_required`.
   - Host preserves `status: "input_required"` and sets
     `hostHandlingState = "unsupported_lifecycle"`.
   - Running-jobs UI surfaces the unsupported-lifecycle message.
   - Host does not call `tasks/result` on it; does not write a
     `failed` envelope.
-  - User-triggered `tasks/cancel` succeeds.
+  - **Shared poller stops issuing `tasks/get` for that
+    task (v14)**; no further outbound polling traffic
+    is observed.
+  - User-triggered `tasks/cancel` succeeds **only** when
+    the server advertises `tasks.cancel` (decision 29).
+  - User-triggered manual refresh issues exactly one
+    `tasks/get`; if still `input_required`, parking
+    resumes.
 
 ## Effort summary
 
@@ -3555,11 +3925,11 @@ substrate.
 | Phase | Estimate |
 |---|---|
 | 0 — Transport reliability + auth-context (inherits `dev` fixes) | 2–4 days |
-| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology, **single authoring profile (v13)**, hop-specific relay + proxy-stamped nonce + folded init probe + `_meta` passthrough (Preview gate), bootstrap trust health check (v13), required text fallback (v13), exactly-one-match `contents[]` (v13), vendor Apps + Tasks schemas, lazy bridge with budget, Hardened scaffolds (manifest review, hash, artifact extension), default-deny legacy renderer, live-chat narrowing, lazy remount | 2.5–3 weeks (v13 absorbs validator + CSP enforcement into Phase 1 to support the unified profile) |
-| 2P — Apps Preview release (single-ACL refactor, truthful HostContext minimum subset, fullscreen gate, payload truncation, rate limits, capability turn-on) | 1–1.5 weeks (v13: shorter — validator and CSP enforcement landed in Phase 1) |
-| 2H — Apps Hardened (policy-only delta: manifest review activation, `mcp_app` artifact extension write-through, full legacy retirement, Hardened CSP variant without Wasm/eval, no fullscreen) | 1.5 weeks (separate release; v13 — relay + asset enforcement landed in Phase 1) |
+| 1 — Patch #11799 (incl. authenticated bootstrap fix), unify topology, **single authoring profile (v13)**, **single bridge (v14: SDK only, custom bridge deleted)**, **MCP capability profile marker (v14)**, hop-specific relay + proxy-stamped nonce + folded init probe + `_meta` passthrough (Preview gate), bootstrap trust health check (v13), required text fallback (v13), exactly-one-match `contents[]` (v13), **anchor click interceptor + form/refresh rejection (v14)**, **hard-fail oversize on view path (v14)**, **fullscreen stripped (v14)**, vendor Apps + Tasks schemas, lazy bridge with budget, Hardened scaffolds (manifest review keyed by `mcpServerId`, hash, artifact extension), default-deny legacy renderer, live-chat narrowing, lazy remount | 2.5–3 weeks (v14: relay + bridge unification offsets the new wire-marker and navigation work) |
+| 2P — Apps Preview release (single-ACL refactor, truthful HostContext minimum subset (`inline` only), rate limits, capability turn-on) | 1–1.5 weeks (v14: fullscreen gate work removed) |
+| 2H — Apps Hardened (policy-only delta: manifest review activation, `mcp_app` artifact extension write-through, full legacy retirement, Hardened CSP variant without Wasm/eval) | 1.5 weeks (separate release; v14: fullscreen-strip already in Phase 1) |
 | 3 — `tool-input-partial` (optional) | 1 week (risk) |
-| 4 — MCP Tasks v1 (capability-conditional status-only jobs panel; metadata-only storage with live `tasks/result`; **poller-based wait UI (v13: no blocking waiter)**; `model-immediate-response` as model plumbing; progress UI deferred to #12535 reuse) | 1.5–2 weeks (v13: shorter — wait-restart machine cut) |
+| 4 — MCP Tasks v1 (capability-conditional status-only jobs panel; metadata-only storage with live `tasks/result`; **poller-based wait UI (v13: no blocking waiter)**; **implicit wait-mode for model-started required tasks (v14)**; **`input_required` parks the poller (v14)**; **derived `expiresAt` TTL (v14)**; `model-immediate-response` as model plumbing; progress UI deferred to #12535 reuse) | 1.5–2 weeks (v14: implicit wait + parking are tiny additions on top of the v13 shared poller) |
 | 5 — Hardening + browser matrix + ops docs | 1 week |
 
 **Sequential release order: Apps Preview → Tasks v1 → Apps
