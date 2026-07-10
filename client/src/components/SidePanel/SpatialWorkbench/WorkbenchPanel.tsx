@@ -15,8 +15,14 @@
  * panel is used.
  */
 import React, { useEffect, useRef, useState } from 'react';
+import { useChatFormContext } from '~/Providers';
 
-type PickEntry = { ref: string; scene: string; t: string };
+type PickEntry = {
+  ref: string;
+  component: string;
+  entity: string | null;
+  scene: string;
+};
 
 const ACCENT = 0xb23a2f;
 
@@ -99,7 +105,6 @@ export default function WorkbenchPanel() {
   const [scenes, setScenes] = useState<string[]>([]);
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
-  const [chip, setChip] = useState('');
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
 
   useEffect(() => {
@@ -239,7 +244,7 @@ export default function WorkbenchPanel() {
     c.controls.target.copy(center);
     c.scene = scene;
     setActive(label);
-    clearOverlay();
+    rebuildOverlay(picks); // re-show highlights for picks made in this scene
   }
 
   function clearOverlay() {
@@ -250,12 +255,48 @@ export default function WorkbenchPanel() {
     c.overlay = null;
   }
 
+  /** Redraw highlights for every pick made in the ACTIVE scene. */
+  function rebuildOverlay(list: PickEntry[]) {
+    const c = ctx.current;
+    const THREE = c.THREE;
+    clearOverlay();
+    if (!c.scene) {
+      return;
+    }
+    const group = new THREE.Group();
+    for (const p of list) {
+      if (p.scene !== c.activeLabel) {
+        continue; // picked in another configuration
+      }
+      let node: any = null;
+      c.scene.traverse((o: any) => {
+        if (!node && o.userData && o.userData.id === p.component) {
+          node = o;
+        }
+      });
+      if (!node) {
+        continue;
+      }
+      if (p.entity) {
+        const e = (node.userData.entities || []).find((x: any) => x.id === p.entity);
+        if (e) {
+          group.add(entityOverlay(THREE, e, c.sceneSize));
+        }
+      } else {
+        group.add(new THREE.Box3Helper(new THREE.Box3().setFromObject(node), ACCENT));
+      }
+    }
+    c.scene.add(group);
+    c.overlay = group;
+  }
+
   function pick(ev: PointerEvent) {
     const c = ctx.current;
     const THREE = c.THREE;
     if (!c.scene) {
       return;
     }
+    const append = ev.ctrlKey || ev.shiftKey || ev.metaKey;
     const rect = c.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((ev.clientX - rect.left) / rect.width) * 2 - 1,
@@ -266,9 +307,11 @@ export default function WorkbenchPanel() {
     const hits = ray
       .intersectObjects(c.scene.children, true)
       .filter((h: any) => h.object.userData && h.object.userData.id);
-    clearOverlay();
     if (!hits.length) {
-      setChip('');
+      if (!append) {
+        setPicks([]);
+        rebuildOverlay([]);
+      }
       return;
     }
     const hit = hits[0];
@@ -283,24 +326,61 @@ export default function WorkbenchPanel() {
         best = e;
       }
     }
-    const ref = ud.id + (best ? '.' + best.id : '');
-    const overlay = new THREE.Group();
-    if (best) {
-      overlay.add(entityOverlay(THREE, best, c.sceneSize));
-    } else {
-      overlay.add(new THREE.Box3Helper(new THREE.Box3().setFromObject(hit.object), ACCENT));
-    }
-    c.scene.add(overlay);
-    c.overlay = overlay;
-    setChip(ref);
-    setPicks((prev) =>
-      [{ ref, scene: c.activeLabel, t: new Date().toLocaleTimeString() }, ...prev].slice(0, 12),
-    );
-    // the selection contract a composer bridge would consume
-    console.log('[workbench] selection', {
+    const entity = best ? (best.id as string) : null;
+    const rec: PickEntry = {
+      ref: ud.id + (entity ? '.' + entity : ''),
       component: ud.id,
-      entity: best ? best.id : null,
-      state: c.activeLabel,
+      entity,
+      scene: c.activeLabel,
+    };
+    setPicks((prev) => {
+      const ix = prev.findIndex(
+        (p) => p.component === rec.component && p.entity === rec.entity && p.scene === rec.scene,
+      );
+      let next: PickEntry[];
+      if (append) {
+        // ordered sequence: click order mirrors speech order ("this…that…");
+        // ctrl-clicking a picked reference unpicks it
+        next = ix >= 0 ? prev.filter((_, i) => i !== ix) : [...prev, rec];
+      } else {
+        next = ix >= 0 && prev.length === 1 ? [] : [rec];
+      }
+      rebuildOverlay(next);
+      return next;
+    });
+    console.log('[workbench] selection', {
+      component: rec.component,
+      entity: rec.entity,
+      state: rec.scene,
+    });
+  }
+
+  const methods = useChatFormContext();
+
+  /** The composer bridge: bound references become model-legible text in
+   * the message box - the user types the instruction around them, edits
+   * or deletes them like any text, and the ordinals resolve "this…that…". */
+  function insertIntoMessage() {
+    if (!methods || picks.length === 0) {
+      return;
+    }
+    const tokens =
+      picks.length === 1
+        ? `[selected: ${picks[0].ref} — in ${picks[0].scene}]`
+        : picks.map((p, i) => `[selected ${i + 1}: ${p.ref} — in ${p.scene}]`).join(' ');
+    const cur = (methods.getValues('text') as string) ?? '';
+    methods.setValue('text', (cur ? cur.trimEnd() + ' ' : '') + tokens + ' ', {
+      shouldValidate: true,
+      shouldDirty: true,
+    });
+    (document.querySelector('form textarea') as HTMLTextAreaElement | null)?.focus();
+  }
+
+  function removePick(i: number) {
+    setPicks((prev) => {
+      const next = prev.filter((_, ix) => ix !== i);
+      rebuildOverlay(next);
+      return next;
     });
   }
 
@@ -335,18 +415,34 @@ export default function WorkbenchPanel() {
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
-      {chip !== '' && (
-        <div className="rounded-full border border-border-medium px-2 py-0.5 font-mono text-xs">
-          {chip}
-        </div>
-      )}
       {picks.length > 0 && (
-        <div className="max-h-32 overflow-y-auto font-mono text-xs text-text-secondary">
+        <div className="flex flex-wrap items-center gap-1" data-testid="workbench-picks">
           {picks.map((p, i) => (
-            <div key={i}>
-              {p.t} · {p.ref} <span className="opacity-60">@ {p.scene}</span>
-            </div>
+            <span
+              key={p.ref + p.scene}
+              className="flex items-center gap-1 rounded-full border border-border-medium py-0.5 pl-2 pr-1 font-mono text-xs"
+              title={`picked in ${p.scene}`}
+            >
+              {picks.length > 1 && <b className="text-red-500">{i + 1}</b>}
+              {p.ref}
+              <button
+                type="button"
+                aria-label={`unbind ${p.ref}`}
+                onClick={() => removePick(i)}
+                className="px-1 text-text-secondary hover:text-text-primary"
+              >
+                ×
+              </button>
+            </span>
           ))}
+          <button
+            type="button"
+            onClick={insertIntoMessage}
+            className="rounded-md border border-border-medium px-2 py-0.5 text-xs hover:bg-surface-hover"
+            title="insert the bound references into the message box (click = pick, ctrl-click = add in order)"
+          >
+            → message
+          </button>
         </div>
       )}
     </div>
