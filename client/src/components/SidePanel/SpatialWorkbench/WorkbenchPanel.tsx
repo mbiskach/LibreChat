@@ -105,6 +105,7 @@ export default function WorkbenchPanel() {
   const [scenes, setScenes] = useState<string[]>([]);
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
+  const [selMode, setSelMode] = useState<'part' | 'edge' | 'point'>('part');
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
 
   useEffect(() => {
@@ -317,14 +318,24 @@ export default function WorkbenchPanel() {
     }
     const hit = hits[0];
     const ud = hit.object.userData;
-    // nearest canonical sub-entity to the hit point, threshold ~ scene scale
+    // the selector tool decides granularity: part = the component;
+    // edge/point = the NEAREST canonical entity of that kind on the hit
+    // component (explicit modes, so selection is deterministic - no
+    // guessing whether a click was "close enough" to an edge)
+    const mode = c.selMode ?? 'part';
     let best: any = null;
-    let bestD = Math.max(0.05, c.sceneSize * 0.02);
-    for (const e of ud.entities || []) {
-      const d = entityDistance(THREE, hit.point, e);
-      if (d < bestD) {
-        bestD = d;
-        best = e;
+    if (mode !== 'part') {
+      const want = mode === 'edge' ? 'edge' : 'vertex';
+      let bestD = Infinity;
+      for (const e of ud.entities || []) {
+        if (e.type !== want) {
+          continue;
+        }
+        const d = entityDistance(THREE, hit.point, e);
+        if (d < bestD) {
+          bestD = d;
+          best = e;
+        }
       }
     }
     const entity = best ? (best.id as string) : null;
@@ -413,6 +424,37 @@ export default function WorkbenchPanel() {
               {s}
             </button>
           ))}
+        </div>
+      )}
+      {scenes.length > 0 && (
+        <div className="flex items-center gap-1 text-xs">
+          <span className="text-text-secondary">select:</span>
+          {(['part', 'edge', 'point'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => {
+                ctx.current.selMode = m;
+                setSelMode(m);
+              }}
+              title={
+                m === 'point'
+                  ? 'nearest corner of the clicked part (smooth solids have no corners - rims are edges)'
+                  : m === 'edge'
+                    ? 'nearest edge of the clicked part (incl. rims)'
+                    : 'the whole part'
+              }
+              className={
+                'rounded px-2 py-0.5 ' +
+                (selMode === m
+                  ? 'bg-surface-active-alt font-semibold'
+                  : 'bg-surface-secondary hover:bg-surface-hover')
+              }
+            >
+              {m}
+            </button>
+          ))}
+          <span className="text-text-secondary">· ctrl-click adds in order</span>
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
