@@ -121,9 +121,12 @@ export default function WorkbenchPanel() {
   // call publishes new geometry, the panel picks it up within ~3 s -
   // spike wiring; the production path is a message/artifact renderer hook
   useEffect(() => {
+    // dev override so a second tool instance (tests, demos) can feed the
+    // panel without disturbing the host-owned default channel
+    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
     const iv = setInterval(async () => {
       try {
-        const r = await fetch('http://127.0.0.1:8714/latest.json');
+        const r = await fetch(`http://127.0.0.1:${port}/latest.json`);
         if (!r.ok) {
           return;
         }

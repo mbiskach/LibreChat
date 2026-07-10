@@ -3,6 +3,8 @@ import { useRecoilValue } from 'recoil';
 import { FileSources, LocalStorageKeys } from 'librechat-data-provider';
 import type { ExtendedFile } from '~/common';
 import useResetArtifactsOnConversationChange from '~/hooks/Artifacts/useResetArtifactsOnConversationChange';
+import WorkbenchArtifact from '~/components/SidePanel/SpatialWorkbench/WorkbenchArtifact';
+import { workbenchVisibleState } from '~/components/SidePanel/SpatialWorkbench/workbenchStore';
 import DragDropWrapper from '~/components/Chat/Input/Files/DragDropWrapper';
 import { EditorProvider, ArtifactsProvider } from '~/Providers';
 import { useDeleteFilesMutation } from '~/data-provider';
@@ -58,7 +60,16 @@ export default function Presentation({ children }: { children: React.ReactNode }
     mutateAsync({ files });
   }, [mutateAsync]);
 
+  const workbenchVisible = useRecoilValue(workbenchVisibleState);
+
   const artifactsElement = useMemo(() => {
+    // The Spatial Workbench is a conversation-level "super artifact":
+    // opened deliberately from the header, it takes the wide split over
+    // message artifacts (an explicit user action outranks auto-focus);
+    // closing it restores normal artifact behavior.
+    if (workbenchVisible) {
+      return <WorkbenchArtifact />;
+    }
     if (
       artifactsVisibility === true &&
       currentArtifactId != null &&
@@ -73,7 +84,7 @@ export default function Presentation({ children }: { children: React.ReactNode }
       );
     }
     return null;
-  }, [artifactsVisibility, artifacts, currentArtifactId]);
+  }, [workbenchVisible, artifactsVisibility, artifacts, currentArtifactId]);
 
   return (
     <DragDropWrapper className="relative flex w-full grow overflow-hidden bg-presentation">
