@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { MCPIcon, AttachmentIcon, OpenAIMinimalIcon } from '@librechat/client';
 import {
   Bot,
+  Boxes,
   Brain,
   Bookmark,
   NotebookPen,
@@ -31,6 +32,7 @@ import BookmarkPanel from '~/components/SidePanel/Bookmarks/BookmarkPanel';
 import PanelSwitch from '~/components/SidePanel/Builder/PanelSwitch';
 import Parameters from '~/components/SidePanel/Parameters/Panel';
 import { MemoryPanel } from '~/components/SidePanel/Memories';
+import WorkbenchPanel from '~/components/SidePanel/SpatialWorkbench/WorkbenchPanel';
 import FilesPanel from '~/components/SidePanel/Files/Panel';
 import { PromptsAccordion } from '~/components/Prompts';
 import { SkillsAccordion } from '~/components/Skills';
@@ -176,6 +178,16 @@ export default function useSideNavLinks({
       icon: AttachmentIcon,
       id: 'files',
       Component: FilesPanel,
+    });
+
+    // Spatial Workbench (spike): persistent 3D context surface - renders
+    // domain-produced glTF (scenes = configurations, extras = stable ids)
+    links.push({
+      title: 'com_sidepanel_workbench',
+      label: '',
+      icon: Boxes,
+      id: 'workbench',
+      Component: WorkbenchPanel,
     });
 
     if (
