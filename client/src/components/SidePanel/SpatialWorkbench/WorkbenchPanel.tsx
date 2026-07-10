@@ -117,9 +117,36 @@ export default function WorkbenchPanel() {
     };
   }, []);
 
+  // auto-load from the truss MCP side-channel: when a pack_concept tool
+  // call publishes new geometry, the panel picks it up within ~3 s -
+  // spike wiring; the production path is a message/artifact renderer hook
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch('http://127.0.0.1:8714/latest.json');
+        if (!r.ok) {
+          return;
+        }
+        const j = await r.json();
+        if (j.stamp && j.stamp !== ctx.current.lastStamp) {
+          ctx.current.lastStamp = j.stamp;
+          const g = await fetch(j.url);
+          loadText(`${j.spec_name} (${j.verdict})`, await g.text());
+        }
+      } catch {
+        /* no tool server running - the file input still works */
+      }
+    }, 3000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function loadFile(file: File) {
-    setStatus(`parsing ${file.name}…`);
-    const text = await file.text();
+    loadText(file.name, await file.text());
+  }
+
+  async function loadText(name: string, text: string) {
+    setStatus(`parsing ${name}…`);
     const THREE = await import('three');
     const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
     const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js');
@@ -172,7 +199,7 @@ export default function WorkbenchPanel() {
           (s: any) => (s.userData && s.userData.label) || s.name || 'scene',
         );
         setScenes(labels);
-        setStatus(`${file.name}: ${gltf.scenes.length} configurations`);
+        setStatus(`${name}: ${gltf.scenes.length} configurations`);
         const first = (gltf.scene.userData && gltf.scene.userData.label) || labels[0];
         showScene(first);
       },
