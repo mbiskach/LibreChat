@@ -306,7 +306,8 @@ export default function WorkbenchPanel() {
     ray.setFromCamera(ndc, c.camera);
     const hits = ray
       .intersectObjects(c.scene.children, true)
-      .filter((h: any) => h.object.userData && h.object.userData.id);
+      // the fairing envelope is scenery: pick THROUGH it to the hardware
+      .filter((h: any) => h.object.userData && h.object.userData.id && !h.object.userData.envelope);
     if (!hits.length) {
       if (!append) {
         setPicks([]);
