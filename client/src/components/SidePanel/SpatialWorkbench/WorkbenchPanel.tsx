@@ -107,6 +107,24 @@ export default function WorkbenchPanel() {
   const [picks, setPicks] = useState<PickEntry[]>([]);
   const [selMode, setSelMode] = useState<'part' | 'edge' | 'point'>('part');
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
+  // feedback widget: shown after a tool publishes geometry; the
+  // model-independent channel that calibrates the in-band record_feedback
+  // tool (widget-negatives without a tool-filed negative = under-reporting)
+  const [rated, setRated] = useState<'' | 'up' | 'down' | 'sent'>('');
+  const [why, setWhy] = useState('');
+
+  async function sendFeedback(rating: number, comment?: string) {
+    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
+    try {
+      await fetch(`http://127.0.0.1:${port}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rating, comment }),
+      });
+    } catch {
+      /* corpus is best-effort */
+    }
+  }
 
   useEffect(() => {
     return () => {
@@ -141,6 +159,8 @@ export default function WorkbenchPanel() {
           ctx.current.lastStamp = j.stamp;
           const g = await fetch(j.url);
           loadText(`${j.spec_name} (${j.verdict})`, await g.text());
+          setRated('');
+          setWhy('');
         }
       } catch {
         /* no tool server running - the file input still works */
@@ -407,7 +427,53 @@ export default function WorkbenchPanel() {
           onChange={(e) => e.target.files && e.target.files[0] && loadFile(e.target.files[0])}
         />
       </label>
-      <div className="text-xs text-text-secondary">{status}</div>
+      <div className="flex items-center gap-2 text-xs text-text-secondary">
+        <span className="min-w-0 flex-1 truncate">{status}</span>
+        {ctx.current.lastStamp != null && rated !== 'sent' && (
+          <span className="flex items-center gap-1" data-testid="wb-feedback">
+            {rated === '' ? (
+              <>
+                <button
+                  type="button"
+                  aria-label="that did what I meant"
+                  title="that did what I meant"
+                  className="rounded px-1 hover:bg-surface-hover"
+                  onClick={() => {
+                    sendFeedback(1);
+                    setRated('sent');
+                  }}
+                >
+                  👍
+                </button>
+                <button
+                  type="button"
+                  aria-label="that is not what I meant"
+                  title="that is not what I meant"
+                  className="rounded px-1 hover:bg-surface-hover"
+                  onClick={() => setRated('down')}
+                >
+                  👎
+                </button>
+              </>
+            ) : (
+              <input
+                autoFocus
+                value={why}
+                onChange={(e) => setWhy(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    sendFeedback(-1, why);
+                    setRated('sent');
+                  }
+                }}
+                placeholder="what went wrong? (Enter)"
+                className="w-44 rounded border border-border-medium bg-transparent px-1 py-0.5"
+              />
+            )}
+          </span>
+        )}
+        {rated === 'sent' && <span title="feedback recorded">✓</span>}
+      </div>
       {scenes.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {scenes.map((s) => (
