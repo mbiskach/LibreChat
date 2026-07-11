@@ -120,6 +120,7 @@ export default function WorkbenchPanel() {
   const [deployT, setDeployT] = useState(1);
   const [stripBg, setStripBg] = useState('');
   const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
+  const [ghost, setGhost] = useState(false);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -315,10 +316,15 @@ export default function WorkbenchPanel() {
       c.mixer = new THREE.AnimationMixer(scene);
       c.mixer.clipAction(clip).play();
       c.mixer.setTime(1); // rest at the deployed pose
+      c.lastDeployT = 1;
       setHasDeploy(true);
       setDeployT(1);
       buildStrip();
+      if (c.ghostOn) {
+        buildGhost();
+      }
     } else {
+      clearGhost();
       setHasDeploy(false);
       setStripBg('');
       setInterferences([]);
@@ -361,9 +367,68 @@ export default function WorkbenchPanel() {
   function scrubDeploy(t: number) {
     setDeployT(t);
     const c = ctx.current;
+    c.lastDeployT = t;
     if (c.mixer) {
       c.mixer.setTime(t);
     }
+  }
+
+  function clearGhost() {
+    const c = ctx.current;
+    if (c.ghostGroup && c.ghostGroup.parent) {
+      c.ghostGroup.parent.remove(c.ghostGroup);
+    }
+    c.ghostGroup = null;
+  }
+
+  /** The swept volume as a picture: translucent copies of every moving
+   * part at sampled points of the timeline - the keep-out corridor a
+   * deployment needs, visible at a glance. */
+  function buildGhost() {
+    const c = ctx.current;
+    const THREE = c.THREE;
+    clearGhost();
+    if (!c.scene || !c.mixer) {
+      return;
+    }
+    const meshes: any[] = [];
+    c.scene.traverse((o: any) => {
+      if (o.isMesh && o.userData && o.userData.id && !o.userData.envelope) {
+        meshes.push(o);
+      }
+    });
+    const K = 8;
+    const samples: Map<any, any[]> = new Map(meshes.map((m) => [m, []]));
+    for (let k = 0; k < K; k++) {
+      c.mixer.setTime(k / (K - 1));
+      c.scene.updateMatrixWorld(true);
+      for (const m of meshes) {
+        samples.get(m)!.push(m.matrixWorld.clone());
+      }
+    }
+    c.mixer.setTime(c.lastDeployT ?? 1);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x7d8fa5,
+      transparent: true,
+      opacity: 0.1,
+      depthWrite: false,
+    });
+    const group = new THREE.Group();
+    for (const m of meshes) {
+      const mats = samples.get(m)!;
+      if (mats.every((mx) => mx.equals(mats[0]))) {
+        continue; // static part: no corridor
+      }
+      for (const mx of mats) {
+        const g = new THREE.Mesh(m.geometry, mat);
+        g.matrixAutoUpdate = false;
+        g.matrix.copy(mx);
+        g.raycast = () => undefined; // ghosts are scenery, never pickable
+        group.add(g);
+      }
+    }
+    c.scene.add(group);
+    c.ghostGroup = group;
   }
 
   /** Engine-sampled clearance at scrub position t: tightest across the
@@ -826,6 +891,29 @@ export default function WorkbenchPanel() {
               </span>
             );
           })()}
+          <button
+            type="button"
+            onClick={() => {
+              const on = !ctx.current.ghostOn;
+              ctx.current.ghostOn = on;
+              setGhost(on);
+              if (on) {
+                buildGhost();
+              } else {
+                clearGhost();
+              }
+            }}
+            title="show the swept volume: translucent copies of every moving part along its motion - the corridor the deployment needs"
+            className={
+              'rounded px-2 py-0.5 ' +
+              (ghost
+                ? 'bg-surface-active-alt font-semibold'
+                : 'bg-surface-secondary hover:bg-surface-hover')
+            }
+            data-testid="wb-deploy-ghost"
+          >
+            ghost
+          </button>
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
