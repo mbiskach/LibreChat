@@ -25,6 +25,7 @@ type PickEntry = {
 };
 
 const ACCENT = 0xb23a2f;
+const MENTION = 0xd99a2b; // refs the model cited in its latest reply
 
 function entityDistance(THREE: any, p: any, e: any): number {
   if (e.type === 'vertex' && e.point) {
@@ -60,12 +61,12 @@ function entityDistance(THREE: any, p: any, e: any): number {
   return Infinity;
 }
 
-function entityOverlay(THREE: any, e: any, size: number): any {
-  const mat = new THREE.LineBasicMaterial({ color: ACCENT });
+function entityOverlay(THREE: any, e: any, size: number, color: number = ACCENT): any {
+  const mat = new THREE.LineBasicMaterial({ color });
   if (e.type === 'vertex' && e.point) {
     const s = new THREE.Mesh(
       new THREE.SphereGeometry(size * 0.012, 12, 12),
-      new THREE.MeshBasicMaterial({ color: ACCENT }),
+      new THREE.MeshBasicMaterial({ color }),
     );
     s.position.set(...(e.point as [number, number, number]));
     return s;
@@ -112,6 +113,7 @@ export default function WorkbenchPanel() {
   // tool (widget-negatives without a tool-filed negative = under-reporting)
   const [rated, setRated] = useState<'' | 'up' | 'down' | 'sent'>('');
   const [why, setWhy] = useState('');
+  const [mentionCount, setMentionCount] = useState(0);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -224,6 +226,30 @@ export default function WorkbenchPanel() {
           };
           loop();
         }
+        // the mention matcher's vocabulary: every component id and
+        // canonical entity id in the model (envelopes are scenery -
+        // a cited fairing would just box the whole view)
+        const compIds = new Set<string>();
+        const entIds = new Map<string, Set<string>>();
+        for (const s of gltf.scenes) {
+          s.traverse((o: any) => {
+            const ud = o.userData || {};
+            if (ud.id && !ud.envelope) {
+              compIds.add(ud.id);
+              if (ud.entities) {
+                const set = entIds.get(ud.id) ?? new Set<string>();
+                for (const e of ud.entities) {
+                  set.add(e.id);
+                }
+                entIds.set(ud.id, set);
+              }
+            }
+          });
+        }
+        c.compIds = compIds;
+        c.entIds = entIds;
+        c.mentions = [];
+        c.lastMentionText = null; // rescan against the fresh vocabulary
         const labels = gltf.scenes.map(
           (s: any) => (s.userData && s.userData.label) || s.name || 'scene',
         );
@@ -266,6 +292,7 @@ export default function WorkbenchPanel() {
     c.scene = scene;
     setActive(label);
     rebuildOverlay(picks); // re-show highlights for picks made in this scene
+    rebuildMentionOverlay(); // reply citations follow the active scene
   }
 
   function clearOverlay() {
@@ -310,6 +337,108 @@ export default function WorkbenchPanel() {
     c.scene.add(group);
     c.overlay = group;
   }
+
+  function clearMentionOverlay() {
+    const c = ctx.current;
+    if (c.mentionOverlay && c.mentionOverlay.parent) {
+      c.mentionOverlay.parent.remove(c.mentionOverlay);
+    }
+    c.mentionOverlay = null;
+  }
+
+  /** Amber highlights for refs the model cited in its latest reply. */
+  function rebuildMentionOverlay() {
+    const c = ctx.current;
+    const THREE = c.THREE;
+    clearMentionOverlay();
+    if (!c.scene || !c.mentions || c.mentions.length === 0) {
+      return;
+    }
+    const group = new THREE.Group();
+    for (const m of c.mentions) {
+      let node: any = null;
+      c.scene.traverse((o: any) => {
+        if (!node && o.userData && o.userData.id === m.component) {
+          node = o;
+        }
+      });
+      if (!node) {
+        continue; // not present in this configuration
+      }
+      if (m.entity) {
+        const e = (node.userData.entities || []).find((x: any) => x.id === m.entity);
+        if (e) {
+          group.add(entityOverlay(THREE, e, c.sceneSize, MENTION));
+        }
+      } else {
+        group.add(new THREE.Box3Helper(new THREE.Box3().setFromObject(node), MENTION));
+      }
+    }
+    c.scene.add(group);
+    c.mentionOverlay = group;
+  }
+
+  /** Scan the newest assistant turn for component/entity refs so the
+   * reply's subjects light up in the view. Vocabulary-bound (only ids
+   * that exist in the loaded model match), qualified refs beat whole-
+   * part boxes, and bare `edge(...)` refs attach only when exactly one
+   * component is in play - no guessing. */
+  function scanReplyMentions() {
+    const c = ctx.current;
+    if (!c.gltf || !c.compIds) {
+      return;
+    }
+    const turns = document.querySelectorAll('main .agent-turn');
+    const text = turns.length ? (turns[turns.length - 1].textContent ?? '') : '';
+    if (text === c.lastMentionText) {
+      return;
+    }
+    c.lastMentionText = text;
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mentions: { component: string; entity: string | null }[] = [];
+    const seen = new Set<string>();
+    const add = (component: string, entity: string | null) => {
+      const k = component + '|' + (entity ?? '');
+      if (!seen.has(k)) {
+        seen.add(k);
+        mentions.push({ component, entity });
+      }
+    };
+    for (const mt of text.matchAll(/([A-Za-z_]\w*)\.((?:edge|vertex)\([^)\s]{1,40}\))/g)) {
+      if (c.compIds.has(mt[1]) && c.entIds.get(mt[1])?.has(mt[2])) {
+        add(mt[1], mt[2]);
+      }
+    }
+    const compsInText: string[] = [];
+    for (const id of c.compIds) {
+      if (new RegExp('\\b' + esc(id) + '\\b').test(text)) {
+        compsInText.push(id);
+      }
+    }
+    if (compsInText.length === 1) {
+      for (const mt of text.matchAll(/(?:^|[^.\w])((?:edge|vertex)\([^)\s]{1,40}\))/g)) {
+        if (c.entIds.get(compsInText[0])?.has(mt[1])) {
+          add(compsInText[0], mt[1]);
+        }
+      }
+    }
+    for (const comp of compsInText) {
+      if (!mentions.some((m) => m.component === comp && m.entity)) {
+        add(comp, null);
+      }
+    }
+    c.mentions = mentions.slice(0, 12); // a reply that names everything highlights nothing useful
+    setMentionCount(c.mentions.length);
+    rebuildMentionOverlay();
+  }
+
+  // reply-reference highlighting: poll the newest assistant turn (DOM
+  // spike wiring, like auto-load; production hooks the message stream)
+  useEffect(() => {
+    const iv = setInterval(scanReplyMentions, 2500);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function pick(ev: PointerEvent) {
     const c = ctx.current;
@@ -530,6 +659,11 @@ export default function WorkbenchPanel() {
             </button>
           ))}
           <span className="text-text-secondary">· ctrl-click adds in order</span>
+          {mentionCount > 0 && (
+            <span className="text-amber-500" title="geometry the reply refers to is outlined in amber">
+              · {mentionCount} in reply
+            </span>
+          )}
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
