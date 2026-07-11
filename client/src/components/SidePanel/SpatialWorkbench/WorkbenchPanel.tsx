@@ -118,6 +118,8 @@ export default function WorkbenchPanel() {
   // deploy animation (glTF animation named `deploy · <scene label>`)
   const [hasDeploy, setHasDeploy] = useState(false);
   const [deployT, setDeployT] = useState(1);
+  const [stripBg, setStripBg] = useState('');
+  const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -315,9 +317,45 @@ export default function WorkbenchPanel() {
       c.mixer.setTime(1); // rest at the deployed pose
       setHasDeploy(true);
       setDeployT(1);
+      buildStrip();
     } else {
       setHasDeploy(false);
+      setStripBg('');
+      setInterferences([]);
     }
+  }
+
+  /** The clearance strip: engine-sampled clearance along the whole
+   * sequence as a color band (red = interference interval, amber =
+   * tight), clickable to jump the scrubber to that moment. */
+  function buildStrip() {
+    const curves = ctx.current.deployCurves as any[] | null;
+    if (!curves || curves.length === 0) {
+      setStripBg('');
+      setInterferences([]);
+      return;
+    }
+    const N = 96;
+    const stops: string[] = [];
+    for (let i = 0; i < N; i++) {
+      const v = clearanceAt(i / (N - 1));
+      const col =
+        v == null ? '#4b5563' : v <= 1e-6 ? '#dc2626' : v < 0.15 ? '#d97706' : '#57755a';
+      stops.push(`${col} ${(i / N) * 100}%`, `${col} ${((i + 1) / N) * 100}%`);
+    }
+    setStripBg(`linear-gradient(to right, ${stops.join(',')})`);
+    const segs: Array<[number, number, string]> = [];
+    for (const c of curves) {
+      const [w0, w1] = (c.window as [number, number] | undefined) ?? [0, 1];
+      for (const iv of c.intervals ?? []) {
+        segs.push([
+          w0 + iv.t[0] * (w1 - w0),
+          w0 + iv.t[1] * (w1 - w0),
+          `${c.component} × ${iv.other}`,
+        ]);
+      }
+    }
+    setInterferences(segs);
   }
 
   function scrubDeploy(t: number) {
@@ -742,16 +780,36 @@ export default function WorkbenchPanel() {
           <span className="text-text-secondary" title="scrub the deployment motion (0 = start, 1 = deployed)">
             deploy
           </span>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={deployT}
-            onChange={(e) => scrubDeploy(parseFloat(e.target.value))}
-            className="flex-1"
-            data-testid="wb-deploy-scrub"
-          />
+          <div className="flex flex-1 flex-col gap-0.5">
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={deployT}
+              onChange={(e) => scrubDeploy(parseFloat(e.target.value))}
+              className="w-full"
+              data-testid="wb-deploy-scrub"
+            />
+            {stripBg && (
+              <div
+                className="h-1.5 w-full cursor-pointer rounded-sm"
+                style={{ background: stripBg }}
+                data-testid="wb-deploy-strip"
+                title={
+                  interferences.length
+                    ? 'engine-sampled clearance along the sequence — RED = interference (' +
+                      interferences.map((s) => s[2]).join('; ') +
+                      '); click to jump'
+                    : 'engine-sampled clearance along the sequence; click to jump'
+                }
+                onClick={(e) => {
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  scrubDeploy(Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1));
+                }}
+              />
+            )}
+          </div>
           {(() => {
             const v = clearanceAt(deployT);
             if (v == null) {
