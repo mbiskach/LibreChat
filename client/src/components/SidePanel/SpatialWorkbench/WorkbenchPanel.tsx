@@ -341,15 +341,20 @@ export default function WorkbenchPanel() {
       if (!pts.length) {
         continue;
       }
+      // sequenced timeline: each stage animates inside its window and
+      // holds its start/final pose outside it - map global t to the
+      // stage-local motion parameter before sampling its curve
+      const [w0, w1] = (c.window as [number, number] | undefined) ?? [0, 1];
+      const lt = Math.min(Math.max((t - w0) / (w1 - w0 || 1), 0), 1);
       let v = pts[pts.length - 1][1];
-      if (t <= pts[0][0]) {
+      if (lt <= pts[0][0]) {
         v = pts[0][1];
       } else {
         for (let i = 1; i < pts.length; i++) {
-          if (t <= pts[i][0]) {
+          if (lt <= pts[i][0]) {
             const [t0, d0] = pts[i - 1];
             const [t1, d1] = pts[i];
-            v = d0 + ((d1 - d0) * (t - t0)) / (t1 - t0 || 1);
+            v = d0 + ((d1 - d0) * (lt - t0)) / (t1 - t0 || 1);
             break;
           }
         }
