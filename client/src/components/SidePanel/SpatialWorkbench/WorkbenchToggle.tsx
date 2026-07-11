@@ -18,6 +18,7 @@ export default function WorkbenchToggle() {
   useEffect(() => {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
     let last: number | null = null;
+    let sawEmpty = false;
     const iv = setInterval(async () => {
       try {
         const r = await fetch(`http://127.0.0.1:${port}/latest.json`);
@@ -26,10 +27,17 @@ export default function WorkbenchToggle() {
         }
         const j = await r.json();
         if (!j.stamp) {
+          // channel confirmed EMPTY: the next stamp to appear is NEW
+          // geometry, not pre-existing (the take-2 lesson: baselining
+          // the first-ever publish swallowed the auto-open)
+          sawEmpty = true;
           return;
         }
         if (last === null) {
-          last = j.stamp; // baseline: pre-existing geometry stays quiet
+          last = j.stamp;
+          if (sawEmpty) {
+            setVisible(true); // first publish since we started watching
+          }
           return;
         }
         if (j.stamp !== last) {
