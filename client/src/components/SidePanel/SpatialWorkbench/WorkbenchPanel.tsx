@@ -118,6 +118,15 @@ export default function WorkbenchPanel() {
   // deploy animation (glTF animation named `deploy · <scene label>`)
   const [hasDeploy, setHasDeploy] = useState(false);
   const [deployT, setDeployT] = useState(1);
+  const [playing, setPlaying] = useState(false);
+  // the ordered deploy steps of the active configuration (one per stage/
+  // chain leg), each with the timeline window it plays in and its
+  // tightest engine-sampled clearance - the "all steps for this payload"
+  // list, click to jump
+  const [steps, setSteps] = useState<
+    Array<{ label: string; w0: number; w1: number; jumpT: number;
+            clear: number | null; color: string }>
+  >([]);
   const [stripBg, setStripBg] = useState('');
   const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
   const [ghost, setGhost] = useState(false);
@@ -143,6 +152,9 @@ export default function WorkbenchPanel() {
       const c = ctx.current;
       if (c.raf) {
         cancelAnimationFrame(c.raf);
+      }
+      if (c.playRaf) {
+        cancelAnimationFrame(c.playRaf);
       }
       if (c.renderer) {
         c.renderer.dispose();
@@ -305,17 +317,25 @@ export default function WorkbenchPanel() {
     rebuildMentionOverlay(); // reply citations follow the active scene
 
     const seen = new Map<string, string>();
+    const compColor = new Map<string, string>();
     scene.traverse((o: any) => {
       const ud = o.userData || {};
-      if (ud.system && ud.system_color && !ud.envelope && !seen.has(ud.system)) {
-        seen.set(ud.system, ud.system_color);
+      if (ud.system && ud.system_color && !ud.envelope) {
+        if (!seen.has(ud.system)) {
+          seen.set(ud.system, ud.system_color);
+        }
+        if (ud.id) {
+          compColor.set(ud.id, ud.system_color);
+        }
       }
     });
     setLegend([...seen.entries()].map(([system, color]) => ({ system, color })));
+    c.compColor = compColor;
 
     // deployment: per-t clearance curves ride the scene extras; the
     // animation (if any) is named after the scene label
     c.deployCurves = (scene.userData && scene.userData.deployment) || null;
+    stopPlay();
     if (c.mixer) {
       c.mixer.stopAllAction();
       c.mixer = null;
@@ -332,6 +352,7 @@ export default function WorkbenchPanel() {
       setHasDeploy(true);
       setDeployT(1);
       buildStrip();
+      buildSteps();
       if (c.ghostOn) {
         buildGhost();
       }
@@ -340,7 +361,89 @@ export default function WorkbenchPanel() {
       setHasDeploy(false);
       setStripBg('');
       setInterferences([]);
+      setSteps([]);
     }
+  }
+
+  /** Enumerate the active configuration's deploy steps (one per stage /
+   * chain leg), in play order, each mapped to the timeline window it
+   * animates in and its tightest clearance - the "view all steps for
+   * this payload" list. */
+  function buildSteps() {
+    const c = ctx.current;
+    const curves = (c.deployCurves as any[] | null) ?? [];
+    const compColor: Map<string, string> = c.compColor ?? new Map();
+    const rows = curves
+      .map((cv) => {
+        const [w0, w1] = (cv.window as [number, number] | undefined) ?? [0, 1];
+        const pts = (cv.curve || []).filter((p: any) => p[1] != null);
+        const intersects = (cv.intervals ?? []).length > 0;
+        let clear: number | null = null;
+        let localWorst = 1;
+        if (pts.length) {
+          let best = Infinity;
+          for (const [t, d] of pts) {
+            if (d < best) {
+              best = d;
+              localWorst = t;
+            }
+          }
+          clear = best;
+        }
+        // jump to the interference start if any, else the tightest moment
+        const localJump = intersects ? cv.intervals[0].t[0] : localWorst;
+        const leg = cv.leg ? ` leg ${cv.leg}/${cv.legs}` : '';
+        return {
+          label: `${cv.component}${leg}`,
+          w0,
+          w1,
+          jumpT: w0 + localJump * (w1 - w0),
+          clear: intersects ? null : clear,
+          color: compColor.get(cv.component) ?? '#8a8a8a',
+        };
+      })
+      .sort((a, b) => a.w0 - b.w0);
+    setSteps(rows);
+  }
+
+  function stopPlay() {
+    const c = ctx.current;
+    c.playing = false;
+    if (c.playRaf) {
+      cancelAnimationFrame(c.playRaf);
+      c.playRaf = 0;
+    }
+    setPlaying(false);
+  }
+
+  /** Play the whole sequenced timeline smoothly to the deployed pose. */
+  function togglePlay() {
+    const c = ctx.current;
+    if (c.playing) {
+      stopPlay();
+      return;
+    }
+    if ((c.lastDeployT ?? 1) >= 0.999) {
+      scrubDeploy(0); // replay from stowed if resting at deployed
+    }
+    c.playing = true;
+    setPlaying(true);
+    const DURATION = 6000; // ms for the full sequence
+    let last = performance.now();
+    const step = (now: number) => {
+      if (!c.playing) {
+        return;
+      }
+      const t = Math.min((c.lastDeployT ?? 0) + (now - last) / DURATION, 1);
+      last = now;
+      scrubDeploy(t);
+      if (t >= 1) {
+        stopPlay();
+        return;
+      }
+      c.playRaf = requestAnimationFrame(step);
+    };
+    c.playRaf = requestAnimationFrame(step);
   }
 
   /** The clearance strip: engine-sampled clearance along the whole
@@ -854,9 +957,16 @@ export default function WorkbenchPanel() {
       )}
       {hasDeploy && (
         <div className="flex items-center gap-2 text-xs">
-          <span className="text-text-secondary" title="scrub the deployment motion (0 = start, 1 = deployed)">
-            deploy
-          </span>
+          <button
+            type="button"
+            onClick={togglePlay}
+            aria-label={playing ? 'pause deployment' : 'play deployment'}
+            title={playing ? 'pause' : 'play the full deployment sequence'}
+            className="rounded px-2 py-0.5 font-mono hover:bg-surface-hover"
+            data-testid="wb-deploy-play"
+          >
+            {playing ? '❚❚' : '▶'}
+          </button>
           <div className="flex flex-1 flex-col gap-0.5">
             <input
               type="range"
@@ -864,7 +974,10 @@ export default function WorkbenchPanel() {
               max={1}
               step={0.01}
               value={deployT}
-              onChange={(e) => scrubDeploy(parseFloat(e.target.value))}
+              onChange={(e) => {
+                stopPlay();
+                scrubDeploy(parseFloat(e.target.value));
+              }}
               className="w-full"
               data-testid="wb-deploy-scrub"
             />
@@ -881,6 +994,7 @@ export default function WorkbenchPanel() {
                     : 'engine-sampled clearance along the sequence; click to jump'
                 }
                 onClick={(e) => {
+                  stopPlay();
                   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
                   scrubDeploy(Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1));
                 }}
@@ -926,6 +1040,49 @@ export default function WorkbenchPanel() {
           >
             ghost
           </button>
+        </div>
+      )}
+      {hasDeploy && steps.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-1 text-xs"
+          data-testid="wb-deploy-steps"
+        >
+          <span className="text-text-secondary">steps:</span>
+          {steps.map((s, i) => {
+            const active = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
+            const dot =
+              s.clear == null ? '#dc2626' : s.clear < 0.15 ? '#d97706' : '#57755a';
+            return (
+              <button
+                key={s.label + i}
+                type="button"
+                onClick={() => {
+                  stopPlay();
+                  scrubDeploy(s.jumpT);
+                }}
+                title={
+                  `${s.label} · ${(s.w0 * 100).toFixed(0)}–${(s.w1 * 100).toFixed(0)}% of the sequence · ` +
+                  (s.clear == null
+                    ? 'INTERSECTS (jumps to the interference)'
+                    : `min clearance ${s.clear.toFixed(2)} m (jumps to the tightest moment)`)
+                }
+                className={
+                  'flex items-center gap-1 rounded-full border py-0.5 pl-1.5 pr-2 font-mono ' +
+                  (active
+                    ? 'border-border-heavy bg-surface-active-alt'
+                    : 'border-border-medium hover:bg-surface-hover')
+                }
+              >
+                <span className="text-text-secondary">{i + 1}</span>
+                <span
+                  className="inline-block h-2 w-2 rounded-sm"
+                  style={{ background: s.color }}
+                />
+                <span>{s.label}</span>
+                <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: dot }} />
+              </button>
+            );
+          })}
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
