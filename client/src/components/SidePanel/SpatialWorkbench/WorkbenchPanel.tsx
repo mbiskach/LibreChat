@@ -114,6 +114,10 @@ export default function WorkbenchPanel() {
   const [rated, setRated] = useState<'' | 'up' | 'down' | 'sent'>('');
   const [why, setWhy] = useState('');
   const [mentionCount, setMentionCount] = useState(0);
+  // deployment scrubber: shown when the active configuration carries a
+  // deploy animation (glTF animation named `deploy · <scene label>`)
+  const [hasDeploy, setHasDeploy] = useState(false);
+  const [deployT, setDeployT] = useState(1);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -293,6 +297,68 @@ export default function WorkbenchPanel() {
     setActive(label);
     rebuildOverlay(picks); // re-show highlights for picks made in this scene
     rebuildMentionOverlay(); // reply citations follow the active scene
+
+    // deployment: per-t clearance curves ride the scene extras; the
+    // animation (if any) is named after the scene label
+    c.deployCurves = (scene.userData && scene.userData.deployment) || null;
+    if (c.mixer) {
+      c.mixer.stopAllAction();
+      c.mixer = null;
+    }
+    const anims = (c.gltf && c.gltf.animations) || [];
+    const clip = anims.find(
+      (a: any) => a.name === `deploy · ${label}` || a.name.endsWith(label),
+    );
+    if (clip) {
+      c.mixer = new THREE.AnimationMixer(scene);
+      c.mixer.clipAction(clip).play();
+      c.mixer.setTime(1); // rest at the deployed pose
+      setHasDeploy(true);
+      setDeployT(1);
+    } else {
+      setHasDeploy(false);
+    }
+  }
+
+  function scrubDeploy(t: number) {
+    setDeployT(t);
+    const c = ctx.current;
+    if (c.mixer) {
+      c.mixer.setTime(t);
+    }
+  }
+
+  /** Engine-sampled clearance at scrub position t: tightest across the
+   * scene's deployment stages, interpolated between the sweep samples. */
+  function clearanceAt(t: number): number | null {
+    const curves = ctx.current.deployCurves as any[] | null;
+    if (!curves || curves.length === 0) {
+      return null;
+    }
+    let worst: number | null = null;
+    for (const c of curves) {
+      const pts = (c.curve || []).filter((p: any) => p[1] != null);
+      if (!pts.length) {
+        continue;
+      }
+      let v = pts[pts.length - 1][1];
+      if (t <= pts[0][0]) {
+        v = pts[0][1];
+      } else {
+        for (let i = 1; i < pts.length; i++) {
+          if (t <= pts[i][0]) {
+            const [t0, d0] = pts[i - 1];
+            const [t1, d1] = pts[i];
+            v = d0 + ((d1 - d0) * (t - t0)) / (t1 - t0 || 1);
+            break;
+          }
+        }
+      }
+      if (worst == null || v < worst) {
+        worst = v;
+      }
+    }
+    return worst;
   }
 
   function clearOverlay() {
@@ -664,6 +730,39 @@ export default function WorkbenchPanel() {
               · {mentionCount} in reply
             </span>
           )}
+        </div>
+      )}
+      {hasDeploy && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-text-secondary" title="scrub the deployment motion (0 = start, 1 = deployed)">
+            deploy
+          </span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={deployT}
+            onChange={(e) => scrubDeploy(parseFloat(e.target.value))}
+            className="flex-1"
+            data-testid="wb-deploy-scrub"
+          />
+          {(() => {
+            const v = clearanceAt(deployT);
+            if (v == null) {
+              return null;
+            }
+            const cls =
+              v <= 1e-6 ? 'text-red-500' : v < 0.15 ? 'text-amber-500' : 'text-text-secondary';
+            return (
+              <span
+                className={cls}
+                title="tightest clearance across this configuration's deployment stages at the scrubbed position - engine-sampled, interpolated between samples"
+              >
+                {v <= 1e-6 ? 'INTERSECTS' : `min clear ${v.toFixed(2)} m`}
+              </span>
+            );
+          })()}
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
