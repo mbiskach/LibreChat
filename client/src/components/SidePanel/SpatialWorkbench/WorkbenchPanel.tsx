@@ -121,6 +121,9 @@ export default function WorkbenchPanel() {
   const [stripBg, setStripBg] = useState('');
   const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
   const [ghost, setGhost] = useState(false);
+  // one color per major system (from glTF extras.system/system_color -
+  // twins and mosaic segments share their subsystem's color)
+  const [legend, setLegend] = useState<Array<{ system: string; color: string }>>([]);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -300,6 +303,15 @@ export default function WorkbenchPanel() {
     setActive(label);
     rebuildOverlay(picks); // re-show highlights for picks made in this scene
     rebuildMentionOverlay(); // reply citations follow the active scene
+
+    const seen = new Map<string, string>();
+    scene.traverse((o: any) => {
+      const ud = o.userData || {};
+      if (ud.system && ud.system_color && !ud.envelope && !seen.has(ud.system)) {
+        seen.set(ud.system, ud.system_color);
+      }
+    });
+    setLegend([...seen.entries()].map(([system, color]) => ({ system, color })));
 
     // deployment: per-t clearance curves ride the scene extras; the
     // animation (if any) is named after the scene label
@@ -917,6 +929,23 @@ export default function WorkbenchPanel() {
         </div>
       )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
+      {legend.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs"
+          data-testid="wb-legend"
+          title="one color per major system; twins and mirror segments share their system's color"
+        >
+          {legend.map((l) => (
+            <span key={l.system} className="flex items-center gap-1">
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-sm"
+                style={{ background: l.color }}
+              />
+              <span className="text-text-secondary">{l.system}</span>
+            </span>
+          ))}
+        </div>
+      )}
       {picks.length > 0 && (
         <div className="flex flex-wrap items-center gap-1" data-testid="workbench-picks">
           {picks.map((p, i) => (
