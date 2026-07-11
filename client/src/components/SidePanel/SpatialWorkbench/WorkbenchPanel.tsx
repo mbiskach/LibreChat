@@ -405,7 +405,16 @@ export default function WorkbenchPanel() {
       shouldValidate: true,
       shouldDirty: true,
     });
-    (document.querySelector('form textarea') as HTMLTextAreaElement | null)?.focus();
+    // caret to the END so the user's next keystrokes append after the
+    // tokens instead of splicing into them (found on camera: a typed
+    // instruction interleaved mid-token)
+    setTimeout(() => {
+      const ta = document.querySelector('form textarea') as HTMLTextAreaElement | null;
+      if (ta) {
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }
+    }, 0);
   }
 
   function removePick(i: number) {
