@@ -239,6 +239,24 @@ export default function WorkbenchPanel() {
               pick(ev);
             }
           });
+          // double-click a feature -> reference it straight into the chat
+          // (per the active selector: part / edge / point). No "-> message"
+          // step needed; each double-click appends one reference.
+          c.renderer.domElement.addEventListener('dblclick', (ev: PointerEvent) => {
+            const rec = resolvePick(ev);
+            if (!rec) {
+              return;
+            }
+            setPicks((prev) => {
+              const has = prev.some(
+                (p) => p.component === rec.component && p.entity === rec.entity && p.scene === rec.scene,
+              );
+              const next = has ? prev : [...prev, rec];
+              rebuildOverlay(next);
+              return next;
+            });
+            insertOneRef(rec);
+          });
           const loop = () => {
             c.raf = requestAnimationFrame(loop);
             if (c.scene) {
@@ -729,13 +747,14 @@ export default function WorkbenchPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function pick(ev: PointerEvent) {
+  /** Raycast the cursor to a PickEntry per the active selector mode
+   * (part / edge / point), or null if nothing under it. */
+  function resolvePick(ev: PointerEvent): PickEntry | null {
     const c = ctx.current;
     const THREE = c.THREE;
     if (!c.scene) {
-      return;
+      return null;
     }
-    const append = ev.ctrlKey || ev.shiftKey || ev.metaKey;
     const rect = c.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((ev.clientX - rect.left) / rect.width) * 2 - 1,
@@ -748,11 +767,7 @@ export default function WorkbenchPanel() {
       // the fairing envelope is scenery: pick THROUGH it to the hardware
       .filter((h: any) => h.object.userData && h.object.userData.id && !h.object.userData.envelope);
     if (!hits.length) {
-      if (!append) {
-        setPicks([]);
-        rebuildOverlay([]);
-      }
-      return;
+      return null;
     }
     const hit = hits[0];
     const ud = hit.object.userData;
@@ -777,12 +792,24 @@ export default function WorkbenchPanel() {
       }
     }
     const entity = best ? (best.id as string) : null;
-    const rec: PickEntry = {
+    return {
       ref: ud.id + (entity ? '.' + entity : ''),
       component: ud.id,
       entity,
       scene: c.activeLabel,
     };
+  }
+
+  function pick(ev: PointerEvent) {
+    const append = ev.ctrlKey || ev.shiftKey || ev.metaKey;
+    const rec = resolvePick(ev);
+    if (!rec) {
+      if (!append) {
+        setPicks([]);
+        rebuildOverlay([]);
+      }
+      return;
+    }
     setPicks((prev) => {
       const ix = prev.findIndex(
         (p) => p.component === rec.component && p.entity === rec.entity && p.scene === rec.scene,
@@ -806,6 +833,26 @@ export default function WorkbenchPanel() {
   }
 
   const methods = useChatFormContext();
+
+  /** Append ONE reference token to the composer (the double-click path). */
+  function insertOneRef(rec: PickEntry) {
+    if (!methods) {
+      return;
+    }
+    const token = `[selected: ${rec.ref} — in ${rec.scene}]`;
+    const cur = (methods.getValues('text') as string) ?? '';
+    methods.setValue('text', (cur ? cur.trimEnd() + ' ' : '') + token + ' ', {
+      shouldValidate: true,
+      shouldDirty: true,
+    });
+    setTimeout(() => {
+      const ta = document.querySelector('form textarea') as HTMLTextAreaElement | null;
+      if (ta) {
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }
+    }, 0);
+  }
 
   /** The composer bridge: bound references become model-legible text in
    * the message box - the user types the instruction around them, edits
@@ -947,7 +994,7 @@ export default function WorkbenchPanel() {
               {m}
             </button>
           ))}
-          <span className="text-text-secondary">· ctrl-click adds in order</span>
+          <span className="text-text-secondary">· ctrl-click adds · double-click → chat</span>
           {mentionCount > 0 && (
             <span className="text-amber-500" title="geometry the reply refers to is outlined in amber">
               · {mentionCount} in reply
