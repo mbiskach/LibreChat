@@ -365,7 +365,8 @@ export default function WorkbenchPanel() {
     if (clip) {
       c.mixer = new THREE.AnimationMixer(scene);
       c.mixer.clipAction(clip).play();
-      c.mixer.setTime(1); // rest at the deployed pose
+      c.clipDur = clip.duration || 1;
+      seekT(c, 1); // rest at the deployed pose (avoid the loop-wrap at t=dur)
       c.lastDeployT = 1;
       setHasDeploy(true);
       setDeployT(1);
@@ -497,13 +498,23 @@ export default function WorkbenchPanel() {
     setInterferences(segs);
   }
 
+  // Seek the deploy mixer without hitting the loop-wrap: setTime(duration)
+  // on a looping clip wraps back to the stowed pose, so hold just shy of
+  // the end when t reaches 1 (visually the fully deployed frame).
+  function seekT(c: any, t: number) {
+    if (!c.mixer) {
+      return;
+    }
+    const dur = c.clipDur ?? 1;
+    const tt = Math.min(Math.max(t, 0), 1);
+    c.mixer.setTime(tt >= 1 ? dur - 1e-4 : tt * dur);
+  }
+
   function scrubDeploy(t: number) {
     setDeployT(t);
     const c = ctx.current;
     c.lastDeployT = t;
-    if (c.mixer) {
-      c.mixer.setTime(t);
-    }
+    seekT(c, t);
   }
 
   function clearGhost() {
@@ -533,13 +544,13 @@ export default function WorkbenchPanel() {
     const K = 8;
     const samples: Map<any, any[]> = new Map(meshes.map((m) => [m, []]));
     for (let k = 0; k < K; k++) {
-      c.mixer.setTime(k / (K - 1));
+      seekT(c, k / (K - 1));
       c.scene.updateMatrixWorld(true);
       for (const m of meshes) {
         samples.get(m)!.push(m.matrixWorld.clone());
       }
     }
-    c.mixer.setTime(c.lastDeployT ?? 1);
+    seekT(c, c.lastDeployT ?? 1);
     const mat = new THREE.MeshBasicMaterial({
       color: 0x7d8fa5,
       transparent: true,
