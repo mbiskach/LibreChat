@@ -154,6 +154,8 @@ export default function WorkbenchPanel() {
   const [dimWin, setDimWin] = useState<any>(null);
   const [opStatus, setOpStatus] = useState('');
   const [busyOp, setBusyOp] = useState('');
+  // feedback layers (truss docs/layers.md): disciplines collapsed by default
+  const [showL3, setShowL3] = useState(false);
 
   /** POST a whitelisted operation to the tool side-channel. The panel
    * never authors geometry: every edit is a narrow spec operation the
@@ -1424,19 +1426,21 @@ export default function WorkbenchPanel() {
                   no findings data - run a pack tool (older tool servers do not publish findings)
                 </span>
               )}
-              {findings
-                .map((f, i) => [f, i] as [any, number])
-                .filter(([f]) => showPass || f.status !== 'PASS')
-                .filter(
-                  ([f]) =>
-                    !selOnly ||
-                    picks.some((p) =>
-                      new RegExp(
-                        '\\b' + p.component.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b',
-                      ).test(`${f.subject ?? ''} ${f.detail ?? ''}`),
-                    ),
-                )
-                .map(([f, i]) => (
+              {(() => {
+                const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const visible = findings
+                  .map((f, i) => [f, i] as [any, number])
+                  .filter(([f]) => showPass || f.status !== 'PASS')
+                  .filter(
+                    ([f]) =>
+                      !selOnly ||
+                      picks.some((p) =>
+                        new RegExp('\\b' + esc(p.component) + '\\b').test(
+                          `${f.subject ?? ''} ${f.detail ?? ''}`,
+                        ),
+                      ),
+                  );
+                const row = ([f, i]: [any, number]) => (
                   <div
                     key={i}
                     role="button"
@@ -1521,7 +1525,58 @@ export default function WorkbenchPanel() {
                       </div>
                     )}
                   </div>
-                ))}
+                );
+                if (!findings.some((f) => f.layer != null)) {
+                  return visible.map(row); // older tool server: flat list
+                }
+                // feedback layers: geometry always in view, declared-intent
+                // next, disciplines collapsed into the maturity section
+                // (WARN = graded against placeholder data, by definition)
+                const groups = [
+                  { L: 1, label: 'geometry',
+                    hint: 'closed-form fit + interference - concept-agnostic, true at any scale' },
+                  { L: 2, label: 'declared intent',
+                    hint: 'checks this spec opted into by declaring optics / motion / clearance floors' },
+                  { L: 3, label: 'disciplines (advisory)',
+                    hint: 'corpus-scoped engineering checks, largely on placeholder data - the design-maturity view; click to expand' },
+                ];
+                return groups.map(({ L, label, hint }) => {
+                  const rows = visible.filter(([f]) => (f.layer ?? 3) === L);
+                  if (!rows.length) {
+                    return null;
+                  }
+                  const fails = rows.filter(([f]) => f.status === 'FAIL').length;
+                  const warns = rows.filter(([f]) => f.status === 'WARN').length;
+                  const collapsed = L === 3 && !showL3;
+                  return (
+                    <div key={L} className="mb-1.5" data-testid={`wb-layer-${L}`}>
+                      <button
+                        type="button"
+                        disabled={L !== 3}
+                        onClick={() => L === 3 && setShowL3(!showL3)}
+                        title={hint}
+                        className={
+                          'mb-0.5 flex w-full items-center gap-1.5 text-[10px] uppercase tracking-wide text-text-secondary' +
+                          (L === 3 ? ' hover:text-text-primary' : '')
+                        }
+                      >
+                        <span>{label}</span>
+                        {fails > 0 && <span className="normal-case text-red-500">{fails} fail</span>}
+                        {warns > 0 && (
+                          <span
+                            className="normal-case text-amber-500"
+                            title="WARN = graded against placeholder data pending SME confirmation"
+                          >
+                            {warns} placeholder-graded
+                          </span>
+                        )}
+                        {L === 3 && <span className="ml-auto">{collapsed ? '▸' : '▾'}</span>}
+                      </button>
+                      {!collapsed && rows.map(row)}
+                    </div>
+                  );
+                });
+              })()}
             </div>
             <span className="text-[10px] text-text-secondary">
               click a finding to outline its parts · WARN = placeholder data
