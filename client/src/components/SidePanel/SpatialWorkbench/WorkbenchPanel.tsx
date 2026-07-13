@@ -133,6 +133,16 @@ export default function WorkbenchPanel() {
   // one color per major system (from glTF extras.system/system_color -
   // twins and mosaic segments share their subsystem's color)
   const [legend, setLegend] = useState<Array<{ system: string; color: string }>>([]);
+  // UI-refresh spike: tabs are MODES. The viewport stays visible always;
+  // the active mode contributes a side data pane (constraints: the
+  // engine's findings with corpus ids; deploy: the step list) and, for
+  // deploy, the scrubber overlay under the viewport. '' = viewport only.
+  const [mode, setMode] = useState<'' | 'constraints' | 'deploy'>('');
+  const [findings, setFindings] = useState<any[]>([]);
+  const [verdict, setVerdict] = useState('');
+  const [showPass, setShowPass] = useState(false);
+  const [selOnly, setSelOnly] = useState(false);
+  const [findingIx, setFindingIx] = useState(-1);
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -185,6 +195,22 @@ export default function WorkbenchPanel() {
           loadText(`${j.spec_name} (${j.verdict})`, await g.text());
           setRated('');
           setWhy('');
+          setVerdict(j.verdict ?? '');
+          setFindingIx(-1);
+          ctx.current.findingSel = null;
+          // findings ride a sibling content-addressed JSON so the poll
+          // stays small; older servers just have no constraints data
+          if (j.findings_url) {
+            try {
+              const fr = await fetch(j.findings_url);
+              const fd = await fr.json();
+              setFindings(fd.findings ?? []);
+            } catch {
+              setFindings([]);
+            }
+          } else {
+            setFindings([]);
+          }
         }
       } catch {
         /* no tool server running - the file input still works */
@@ -333,6 +359,7 @@ export default function WorkbenchPanel() {
     setActive(label);
     rebuildOverlay(picks); // re-show highlights for picks made in this scene
     rebuildMentionOverlay(); // reply citations follow the active scene
+    rebuildFindingOverlay(); // a clicked finding's outlines follow too
 
     const seen = new Map<string, string>();
     const compColor = new Map<string, string>();
@@ -656,6 +683,72 @@ export default function WorkbenchPanel() {
     c.overlay = group;
   }
 
+  function clearFindingOverlay() {
+    const c = ctx.current;
+    if (c.findingOverlay && c.findingOverlay.parent) {
+      c.findingOverlay.parent.remove(c.findingOverlay);
+    }
+    c.findingOverlay = null;
+  }
+
+  /** Severity-colored outlines for the components a clicked finding
+   * names (red FAIL / amber WARN / green PASS) - the constraints tab's
+   * bridge into the viewport. */
+  function rebuildFindingOverlay() {
+    const c = ctx.current;
+    const THREE = c.THREE;
+    clearFindingOverlay();
+    const sel = c.findingSel;
+    if (!c.scene || !sel || sel.ids.length === 0) {
+      return;
+    }
+    const group = new THREE.Group();
+    for (const id of sel.ids) {
+      let node: any = null;
+      c.scene.traverse((o: any) => {
+        if (!node && o.userData && o.userData.id === id) {
+          node = o;
+        }
+      });
+      if (node) {
+        group.add(new THREE.Box3Helper(new THREE.Box3().setFromObject(node), sel.color));
+      }
+    }
+    c.scene.add(group);
+    c.findingOverlay = group;
+  }
+
+  /** Click a finding row: outline every component it names. Vocabulary-
+   * bound like reply mentions - only ids present in the loaded model
+   * match, so prose in the detail text can never highlight geometry that
+   * does not exist. Clicking the active row clears. */
+  function highlightFinding(row: any, ix: number) {
+    const c = ctx.current;
+    if (!c.compIds) {
+      return;
+    }
+    if (findingIx === ix) {
+      setFindingIx(-1);
+      c.findingSel = null;
+      clearFindingOverlay();
+      return;
+    }
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const text = `${row.subject ?? ''} ${row.detail ?? ''}`;
+    const ids: string[] = [];
+    for (const id of c.compIds) {
+      if (new RegExp('\\b' + esc(id) + '\\b').test(text)) {
+        ids.push(id);
+      }
+    }
+    c.findingSel = {
+      ids,
+      color: row.status === 'FAIL' ? 0xdc2626 : row.status === 'WARN' ? 0xd97706 : 0x57755a,
+    };
+    setFindingIx(ix);
+    rebuildFindingOverlay();
+  }
+
   function clearMentionOverlay() {
     const c = ctx.current;
     if (c.mentionOverlay && c.mentionOverlay.parent) {
@@ -960,6 +1053,38 @@ export default function WorkbenchPanel() {
         {rated === 'sent' && <span title="feedback recorded">✓</span>}
       </div>
       {scenes.length > 0 && (
+        <div className="flex items-center gap-1 text-xs" data-testid="wb-tabs">
+          <span className="text-text-secondary">panel:</span>
+          {(['constraints', 'deploy'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setMode(mode === m ? '' : m)}
+              title={
+                m === 'constraints'
+                  ? 'the engine findings grading this design, with their corpus constraint ids - click a row to outline its parts'
+                  : 'the deployment sequence: scrubber + clearance overlay on the view, step list in the pane'
+              }
+              className={
+                'rounded px-2 py-0.5 ' +
+                (mode === m
+                  ? 'bg-surface-active-alt font-semibold'
+                  : 'bg-surface-secondary hover:bg-surface-hover')
+              }
+            >
+              {m}
+              {m === 'constraints' && findings.some((f) => f.status === 'FAIL') && (
+                <span className="ml-1 text-red-500">
+                  {findings.filter((f) => f.status === 'FAIL').length}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 gap-2">
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+      {scenes.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {scenes.map((s) => (
             <button
@@ -1013,7 +1138,7 @@ export default function WorkbenchPanel() {
           )}
         </div>
       )}
-      {hasDeploy && (
+      {mode === 'deploy' && hasDeploy && (
         <div className="flex items-center gap-2 text-xs">
           <button
             type="button"
@@ -1100,49 +1225,6 @@ export default function WorkbenchPanel() {
           </button>
         </div>
       )}
-      {hasDeploy && steps.length > 0 && (
-        <div
-          className="flex flex-wrap items-center gap-1 text-xs"
-          data-testid="wb-deploy-steps"
-        >
-          <span className="text-text-secondary">steps:</span>
-          {steps.map((s, i) => {
-            const active = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
-            const dot =
-              s.clear == null ? '#dc2626' : s.clear < 0.15 ? '#d97706' : '#57755a';
-            return (
-              <button
-                key={s.label + i}
-                type="button"
-                onClick={() => {
-                  stopPlay();
-                  scrubDeploy(s.jumpT);
-                }}
-                title={
-                  `${s.label} · ${(s.w0 * 100).toFixed(0)}–${(s.w1 * 100).toFixed(0)}% of the sequence · ` +
-                  (s.clear == null
-                    ? 'INTERSECTS (jumps to the interference)'
-                    : `min clearance ${s.clear.toFixed(2)} m (jumps to the tightest moment)`)
-                }
-                className={
-                  'flex items-center gap-1 rounded-full border py-0.5 pl-1.5 pr-2 font-mono ' +
-                  (active
-                    ? 'border-border-heavy bg-surface-active-alt'
-                    : 'border-border-medium hover:bg-surface-hover')
-                }
-              >
-                <span className="text-text-secondary">{i + 1}</span>
-                <span
-                  className="inline-block h-2 w-2 rounded-sm"
-                  style={{ background: s.color }}
-                />
-                <span>{s.label}</span>
-                <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: dot }} />
-              </button>
-            );
-          })}
-        </div>
-      )}
       <div ref={mountRef} className="min-h-[280px] flex-1 overflow-hidden rounded-md" />
       {legend.length > 0 && (
         <div
@@ -1191,6 +1273,196 @@ export default function WorkbenchPanel() {
           </button>
         </div>
       )}
+        </div>
+        {mode === 'constraints' && (
+          <div
+            className="flex w-64 flex-shrink-0 flex-col gap-1 overflow-hidden rounded-md border border-border-medium p-1.5 text-xs"
+            data-testid="wb-constraints"
+          >
+            <div className="flex items-center gap-1">
+              {verdict && (
+                <span
+                  className={
+                    'font-semibold ' + (verdict === 'FITS' ? 'text-green-600' : 'text-red-500')
+                  }
+                >
+                  {verdict}
+                </span>
+              )}
+              <span className="flex-1" />
+              <button
+                type="button"
+                onClick={() => setShowPass(!showPass)}
+                title="also show PASS findings"
+                className={
+                  'rounded px-1.5 py-0.5 ' +
+                  (showPass
+                    ? 'bg-surface-active-alt font-semibold'
+                    : 'bg-surface-secondary hover:bg-surface-hover')
+                }
+              >
+                pass
+              </button>
+              {picks.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelOnly(!selOnly)}
+                  title="only findings that name a picked component"
+                  className={
+                    'rounded px-1.5 py-0.5 ' +
+                    (selOnly
+                      ? 'bg-surface-active-alt font-semibold'
+                      : 'bg-surface-secondary hover:bg-surface-hover')
+                  }
+                >
+                  picked
+                </button>
+              )}
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {findings.length === 0 && (
+                <span className="text-text-secondary">
+                  no findings data - run a pack tool (older tool servers do not publish findings)
+                </span>
+              )}
+              {findings
+                .map((f, i) => [f, i] as [any, number])
+                .filter(([f]) => showPass || f.status !== 'PASS')
+                .filter(
+                  ([f]) =>
+                    !selOnly ||
+                    picks.some((p) =>
+                      new RegExp(
+                        '\\b' + p.component.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b',
+                      ).test(`${f.subject ?? ''} ${f.detail ?? ''}`),
+                    ),
+                )
+                .map(([f, i]) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => highlightFinding(f, i)}
+                    className={
+                      'mb-1 w-full rounded border px-1.5 py-1 text-left ' +
+                      (findingIx === i
+                        ? 'border-border-heavy bg-surface-active-alt'
+                        : 'border-border-medium hover:bg-surface-hover')
+                    }
+                  >
+                    <div className="flex items-center gap-1">
+                      <span
+                        className="inline-block h-2 w-2 flex-shrink-0 rounded-full"
+                        style={{
+                          background:
+                            f.status === 'FAIL'
+                              ? '#dc2626'
+                              : f.status === 'WARN'
+                                ? '#d97706'
+                                : '#57755a',
+                        }}
+                      />
+                      <span className="truncate font-semibold">{f.check}</span>
+                      {f.margin != null && (
+                        <span
+                          className={
+                            'ml-auto flex-shrink-0 font-mono ' +
+                            (f.margin < 0
+                              ? 'text-red-500'
+                              : f.margin < 0.15
+                                ? 'text-amber-500'
+                                : 'text-text-secondary')
+                          }
+                        >
+                          {(f.margin >= 0 ? '+' : '') + f.margin.toFixed(3)} m
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-text-secondary">
+                      {f.subject}: {f.detail}
+                    </div>
+                    {f.constraints && f.constraints.length > 0 && (
+                      <div
+                        className="font-mono text-[10px] text-text-secondary"
+                        title="source-cited corpus constraints this finding grades against (read-only; the corpus changes only through reviewed proposals)"
+                      >
+                        {f.constraints.join(' · ')}
+                      </div>
+                    )}
+                  </button>
+                ))}
+            </div>
+            <span className="text-[10px] text-text-secondary">
+              click a finding to outline its parts · WARN = placeholder data
+            </span>
+          </div>
+        )}
+        {mode === 'deploy' && (
+          <div
+            className="flex w-64 flex-shrink-0 flex-col gap-1 overflow-hidden rounded-md border border-border-medium p-1.5 text-xs"
+            data-testid="wb-deploy-pane"
+          >
+            {!hasDeploy ? (
+              <span className="text-text-secondary">
+                no deployment animation in this configuration - pick one with deploy stages
+              </span>
+            ) : (
+              <>
+                <span className="text-text-secondary">
+                  steps (click to jump the scrubber):
+                </span>
+                <div className="min-h-0 flex-1 overflow-y-auto" data-testid="wb-deploy-steps">
+                  {steps.map((s, i) => {
+                    const stepActive = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
+                    const dot =
+                      s.clear == null ? '#dc2626' : s.clear < 0.15 ? '#d97706' : '#57755a';
+                    return (
+                      <button
+                        key={s.label + i}
+                        type="button"
+                        onClick={() => {
+                          stopPlay();
+                          scrubDeploy(s.jumpT);
+                        }}
+                        title={
+                          `${s.label} · ${(s.w0 * 100).toFixed(0)}–${(s.w1 * 100).toFixed(0)}% of the sequence · ` +
+                          (s.clear == null
+                            ? 'INTERSECTS (jumps to the interference)'
+                            : `min clearance ${s.clear.toFixed(2)} m (jumps to the tightest moment)`)
+                        }
+                        className={
+                          'mb-1 flex w-full items-center gap-1 rounded border px-1.5 py-1 text-left font-mono ' +
+                          (stepActive
+                            ? 'border-border-heavy bg-surface-active-alt'
+                            : 'border-border-medium hover:bg-surface-hover')
+                        }
+                      >
+                        <span className="text-text-secondary">{i + 1}</span>
+                        <span
+                          className="inline-block h-2 w-2 flex-shrink-0 rounded-sm"
+                          style={{ background: s.color }}
+                        />
+                        <span className="min-w-0 flex-1 truncate">{s.label}</span>
+                        <span
+                          className="inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full"
+                          style={{ background: dot }}
+                        />
+                        {s.clear != null && (
+                          <span className="flex-shrink-0 text-text-secondary">
+                            {s.clear.toFixed(2)}m
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+                <span className="text-[10px] text-text-secondary">
+                  scrubber + clearance strip are under the view
+                </span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
