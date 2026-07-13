@@ -124,8 +124,8 @@ export default function WorkbenchPanel() {
   // tightest engine-sampled clearance - the "all steps for this payload"
   // list, click to jump
   const [steps, setSteps] = useState<
-    Array<{ label: string; w0: number; w1: number; jumpT: number;
-            clear: number | null; color: string }>
+    Array<{ label: string; component: string; w0: number; w1: number;
+            jumpT: number; clear: number | null; color: string }>
   >([]);
   const [stripBg, setStripBg] = useState('');
   const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
@@ -137,12 +137,108 @@ export default function WorkbenchPanel() {
   // the active mode contributes a side data pane (constraints: the
   // engine's findings with corpus ids; deploy: the step list) and, for
   // deploy, the scrubber overlay under the viewport. '' = viewport only.
-  const [mode, setMode] = useState<'' | 'constraints' | 'deploy'>('');
+  const [mode, setMode] = useState<'' | 'constraints' | 'deploy' | 'edit'>('');
   const [findings, setFindings] = useState<any[]>([]);
   const [verdict, setVerdict] = useState('');
   const [showPass, setShowPass] = useState(false);
   const [selOnly, setSelOnly] = useState(false);
   const [findingIx, setFindingIx] = useState(-1);
+  // corpus deep-links: /corpus.json is the read-only window into
+  // constraints.yaml (id -> title/statement/source/status)
+  const [corpus, setCorpus] = useState<any>(null);
+  const [openCid, setOpenCid] = useState('');
+  // edit mode: dimensions of the first picked part, edited via the
+  // side-channel /op endpoint - the SAME narrow verbs the model uses
+  const [dims, setDims] = useState<any>(null);
+  const [dimEdits, setDimEdits] = useState<Record<string, string>>({});
+  const [dimWin, setDimWin] = useState<any>(null);
+  const [opStatus, setOpStatus] = useState('');
+  const [busyOp, setBusyOp] = useState('');
+
+  /** POST a whitelisted operation to the tool side-channel. The panel
+   * never authors geometry: every edit is a narrow spec operation the
+   * engine re-verifies, identical to the model's tool path. */
+  async function opPost(tool: string, args: Record<string, unknown>): Promise<any> {
+    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
+    const r = await fetch(`http://127.0.0.1:${port}/op`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, args }),
+    });
+    return r.json();
+  }
+
+  // lazy corpus fetch the first time the constraints tab opens
+  useEffect(() => {
+    if (mode !== 'constraints' || corpus) {
+      return;
+    }
+    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
+    fetch(`http://127.0.0.1:${port}/corpus.json`)
+      .then((r) => r.json())
+      .then((j) => setCorpus(j.constraints ?? {}))
+      .catch(() => setCorpus({}));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  // edit mode follows the first picked part
+  const editTarget = picks.length ? picks[0].component : '';
+  useEffect(() => {
+    if (mode !== 'edit' || !editTarget) {
+      setDims(null);
+      return;
+    }
+    setDims(null);
+    setDimWin(null);
+    setOpStatus('');
+    opPost('dimensions', { component: editTarget }).then((r) => {
+      if (r.ok) {
+        setDims(r.data);
+        const init: Record<string, string> = {};
+        for (const [k, v] of Object.entries(r.data.dims ?? {})) {
+          init[k] = v == null ? '' : String(v);
+        }
+        setDimEdits(init);
+      } else {
+        setOpStatus(r.text);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, editTarget]);
+
+  async function applyDim(param: string) {
+    const v = parseFloat(dimEdits[param]);
+    if (!isFinite(v)) {
+      return;
+    }
+    setBusyOp(param);
+    const r = await opPost('set_dimension', {
+      component: dims.component,
+      parameter: param,
+      value: v,
+    });
+    setBusyOp('');
+    setOpStatus(r.text.split('\n')[0]);
+    // geometry + findings reload via the /latest.json poll on the new stamp
+  }
+
+  async function windowDim(param: string) {
+    const v = parseFloat(dimEdits[param]) || 1;
+    setBusyOp('win:' + param);
+    const r = await opPost('find_window', {
+      component: dims.component,
+      parameter: param,
+      low: Math.max(0.01, v * 0.25),
+      high: Math.max(v * 2.5, v + 1),
+      samples: 7,
+    });
+    setBusyOp('');
+    if (r.ok) {
+      setDimWin({ param, low: Math.max(0.01, v * 0.25), high: Math.max(v * 2.5, v + 1), res: r.data });
+    } else {
+      setOpStatus(r.text.split('\n')[0]);
+    }
+  }
 
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
@@ -441,6 +537,7 @@ export default function WorkbenchPanel() {
         const leg = cv.leg ? ` leg ${cv.leg}/${cv.legs}` : '';
         return {
           label: `${cv.component}${leg}`,
+          component: cv.component as string,
           w0,
           w1,
           jumpT: w0 + localJump * (w1 - w0),
@@ -1055,7 +1152,7 @@ export default function WorkbenchPanel() {
       {scenes.length > 0 && (
         <div className="flex items-center gap-1 text-xs" data-testid="wb-tabs">
           <span className="text-text-secondary">panel:</span>
-          {(['constraints', 'deploy'] as const).map((m) => (
+          {(['constraints', 'deploy', 'edit'] as const).map((m) => (
             <button
               key={m}
               type="button"
@@ -1063,7 +1160,9 @@ export default function WorkbenchPanel() {
               title={
                 m === 'constraints'
                   ? 'the engine findings grading this design, with their corpus constraint ids - click a row to outline its parts'
-                  : 'the deployment sequence: scrubber + clearance overlay on the view, step list in the pane'
+                  : m === 'deploy'
+                    ? 'the deployment sequence: scrubber + clearance overlay on the view, step list in the pane'
+                    : 'pick a part, edit its dimensions - every edit re-verifies through the engine; window shows the feasible range'
               }
               className={
                 'rounded px-2 py-0.5 ' +
@@ -1338,12 +1437,14 @@ export default function WorkbenchPanel() {
                     ),
                 )
                 .map(([f, i]) => (
-                  <button
+                  <div
                     key={i}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => highlightFinding(f, i)}
+                    onKeyDown={(e) => e.key === 'Enter' && highlightFinding(f, i)}
                     className={
-                      'mb-1 w-full rounded border px-1.5 py-1 text-left ' +
+                      'mb-1 w-full cursor-pointer rounded border px-1.5 py-1 text-left ' +
                       (findingIx === i
                         ? 'border-border-heavy bg-surface-active-alt'
                         : 'border-border-medium hover:bg-surface-hover')
@@ -1381,14 +1482,45 @@ export default function WorkbenchPanel() {
                       {f.subject}: {f.detail}
                     </div>
                     {f.constraints && f.constraints.length > 0 && (
-                      <div
-                        className="font-mono text-[10px] text-text-secondary"
-                        title="source-cited corpus constraints this finding grades against (read-only; the corpus changes only through reviewed proposals)"
-                      >
-                        {f.constraints.join(' · ')}
+                      <div className="flex flex-wrap gap-1 pt-0.5">
+                        {f.constraints.map((cid: string) => (
+                          <button
+                            key={cid}
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenCid(openCid === cid ? '' : cid);
+                            }}
+                            title="show this corpus constraint (source-cited; read-only - the corpus changes only through reviewed proposals)"
+                            className={
+                              'rounded px-1 font-mono text-[10px] ' +
+                              (openCid === cid
+                                ? 'bg-surface-active-alt font-semibold'
+                                : 'bg-surface-secondary text-text-secondary hover:bg-surface-hover')
+                            }
+                          >
+                            {cid}
+                          </button>
+                        ))}
                       </div>
                     )}
-                  </button>
+                    {openCid && f.constraints?.includes(openCid) && corpus?.[openCid] && (
+                      <div className="mt-1 rounded border border-border-medium bg-surface-secondary p-1 text-[11px]">
+                        <div className="flex items-center gap-1">
+                          <span className="font-semibold">{corpus[openCid].title}</span>
+                          <span className="ml-auto rounded bg-surface-active-alt px-1 text-[10px]">
+                            {corpus[openCid].status}
+                          </span>
+                        </div>
+                        {corpus[openCid].statement && (
+                          <div className="pt-0.5">{corpus[openCid].statement}</div>
+                        )}
+                        <div className="pt-0.5 font-mono text-[10px] text-text-secondary">
+                          {corpus[openCid].source} · {corpus[openCid].type}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 ))}
             </div>
             <span className="text-[10px] text-text-secondary">
@@ -1415,6 +1547,7 @@ export default function WorkbenchPanel() {
                     const stepActive = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
                     const dot =
                       s.clear == null ? '#dc2626' : s.clear < 0.15 ? '#d97706' : '#57755a';
+                    const picked = picks.some((p) => p.component === s.component);
                     return (
                       <button
                         key={s.label + i}
@@ -1422,6 +1555,10 @@ export default function WorkbenchPanel() {
                         onClick={() => {
                           stopPlay();
                           scrubDeploy(s.jumpT);
+                          // cross-tab sync: outline the moving part
+                          ctx.current.findingSel = { ids: [s.component], color: ACCENT };
+                          setFindingIx(-1);
+                          rebuildFindingOverlay();
                         }}
                         title={
                           `${s.label} · ${(s.w0 * 100).toFixed(0)}–${(s.w1 * 100).toFixed(0)}% of the sequence · ` +
@@ -1433,7 +1570,8 @@ export default function WorkbenchPanel() {
                           'mb-1 flex w-full items-center gap-1 rounded border px-1.5 py-1 text-left font-mono ' +
                           (stepActive
                             ? 'border-border-heavy bg-surface-active-alt'
-                            : 'border-border-medium hover:bg-surface-hover')
+                            : 'border-border-medium hover:bg-surface-hover') +
+                          (picked ? ' border-amber-500' : '')
                         }
                       >
                         <span className="text-text-secondary">{i + 1}</span>
@@ -1457,6 +1595,112 @@ export default function WorkbenchPanel() {
                 </div>
                 <span className="text-[10px] text-text-secondary">
                   scrubber + clearance strip are under the view
+                </span>
+              </>
+            )}
+          </div>
+        )}
+        {mode === 'edit' && (
+          <div
+            className="flex w-64 flex-shrink-0 flex-col gap-1 overflow-hidden rounded-md border border-border-medium p-1.5 text-xs"
+            data-testid="wb-edit-pane"
+          >
+            {!editTarget ? (
+              <span className="text-text-secondary">
+                pick a part in the viewport to edit its dimensions - every
+                edit re-verifies through the engine, nothing is moved by hand
+              </span>
+            ) : !dims ? (
+              <span className="text-text-secondary">
+                loading dimensions of {editTarget}…{opStatus && ` ${opStatus}`}
+              </span>
+            ) : (
+              <>
+                <span className="font-semibold">{dims.component}</span>
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  {Object.entries(dims.dims ?? {}).map(([p, v]) => (
+                    <div key={p} className="mb-1.5">
+                      <div className="flex items-center gap-1">
+                        <span className="min-w-0 flex-1 truncate font-mono">{p}</span>
+                        <input
+                          type="number"
+                          step="0.05"
+                          value={dimEdits[p] ?? ''}
+                          onChange={(e) =>
+                            setDimEdits({ ...dimEdits, [p]: e.target.value })
+                          }
+                          onKeyDown={(e) => e.key === 'Enter' && applyDim(p)}
+                          className="w-20 rounded border border-border-medium bg-transparent px-1 py-0.5 font-mono"
+                          data-testid={`wb-dim-${p}`}
+                        />
+                        <button
+                          type="button"
+                          disabled={busyOp !== ''}
+                          onClick={() => applyDim(p)}
+                          title="apply: the engine re-packs and re-verifies; the view and findings update"
+                          className="rounded bg-surface-secondary px-1.5 py-0.5 hover:bg-surface-hover disabled:opacity-50"
+                        >
+                          {busyOp === p ? '…' : 'set'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyOp !== ''}
+                          onClick={() => windowDim(p)}
+                          title="sweep this dimension for its feasible window (a few seconds of re-packs)"
+                          className="rounded bg-surface-secondary px-1.5 py-0.5 hover:bg-surface-hover disabled:opacity-50"
+                        >
+                          {busyOp === 'win:' + p ? '…' : 'window'}
+                        </button>
+                      </div>
+                      {dimWin && dimWin.param === p && (
+                        <div className="pt-1">
+                          <div
+                            className="relative h-2 w-full overflow-hidden rounded-sm"
+                            style={{ background: '#7f1d1d' }}
+                            title="green = FITS; red = does not fit; white line = current value"
+                          >
+                            {(dimWin.res.windows ?? []).map((w: any, wi: number) => (
+                              <div
+                                key={wi}
+                                className="absolute h-full"
+                                style={{
+                                  background: '#57755a',
+                                  left: `${(100 * (w.lo - dimWin.low)) / (dimWin.high - dimWin.low)}%`,
+                                  width: `${(100 * (w.hi - w.lo)) / (dimWin.high - dimWin.low)}%`,
+                                }}
+                              />
+                            ))}
+                            {isFinite(parseFloat(dimEdits[p])) && (
+                              <div
+                                className="absolute h-full w-0.5 bg-white"
+                                style={{
+                                  left: `${(100 * (parseFloat(dimEdits[p]) - dimWin.low)) / (dimWin.high - dimWin.low)}%`,
+                                }}
+                              />
+                            )}
+                          </div>
+                          <div className="pt-0.5 font-mono text-[10px] text-text-secondary">
+                            {(dimWin.res.windows ?? []).length
+                              ? dimWin.res.windows
+                                  .map((w: any) => `[${w.lo.toFixed(2)}, ${w.hi.toFixed(2)}]`)
+                                  .join(' ')
+                              : 'no feasible value in the swept range'}
+                            {' · swept ['}
+                            {dimWin.low.toFixed(2)}, {dimWin.high.toFixed(2)}]
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {opStatus && (
+                  <span className="truncate font-mono text-[10px]" title={opStatus}>
+                    {opStatus}
+                  </span>
+                )}
+                <span className="text-[10px] text-text-secondary">
+                  edits are spec operations the engine re-verifies - same
+                  verbs the assistant uses
                 </span>
               </>
             )}
