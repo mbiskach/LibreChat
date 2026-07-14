@@ -160,6 +160,12 @@ export default function WorkbenchPanel() {
   // geometry OUT). Drives the export_step tool through the /op endpoint.
   const [exporting, setExporting] = useState(false);
   const [stepLinks, setStepLinks] = useState<Array<{ name: string; url: string; kb: number }>>([]);
+  // guided first-mission tutorial: teaches the trust loop (author -> the
+  // engine judges -> nothing moved by hand) by DOING, and directly
+  // answers the confusions the blinded-persona round surfaced (buried
+  // failures, undefined layers, where's export). 0 = off/done; steps
+  // auto-advance on the state they teach, so it's a coach not a wall.
+  const [tutStep, setTutStep] = useState(0);
 
   /** POST a whitelisted operation to the tool side-channel. The panel
    * never authors geometry: every edit is a narrow spec operation the
@@ -173,6 +179,51 @@ export default function WorkbenchPanel() {
     });
     return r.json();
   }
+
+  // the guided mission: each step teaches by pointing at a real control
+  // and (where it can) auto-advances when the user does the thing. `done`
+  // reads live state; steps without `done` advance on the Next button.
+  const TUT_STEPS: Array<{ text: string; done?: () => boolean }> = [
+    { text: 'Welcome. This workbench shows a spacecraft concept across its whole lifecycle in 3D. Ask the assistant to load a demo (e.g. "load the mission demo"), or load one, to begin.',
+      done: () => scenes.length > 0 },
+    { text: 'Top-right is the ENGINE\'s verdict — FITS or DOES NOT FIT — with a "placeholder-graded" count. The chat only AUTHORS the design; the deterministic engine judges it. That split is why you can trust the verdict.' },
+    { text: 'The buttons above the 3D view switch lifecycle configurations (stowed, deployed, and — for two-launch designs — pre_dock and mated). Click through them to see the concept fold, deploy, and dock.',
+      done: () => active !== '' && active !== scenes[0] },
+    { text: 'Open the CONSTRAINTS tab. Findings group by layer: geometry (true at any scale), declared intent (optics/motion you declared), and disciplines (advisory). Any FAILURE is hoisted to the red "must fix" strip on top.',
+      done: () => mode === 'constraints' },
+    { text: 'Notice every fairing fit says "needs SME verification" — those envelopes are PLACEHOLDER data. The honest rule: trust the relative margins and what\'s driving them, verify the absolute numbers with a real envelope. Click a finding to outline its parts.' },
+    { text: 'Open the EDIT tab, pick a part in the 3D view, and change a dimension. The engine RE-VERIFIES — nothing is moved by hand. The "window" button sweeps a dimension and shows the feasible range, so a red X becomes an actionable window.',
+      done: () => mode === 'edit' },
+    { text: 'Open the DEPLOY tab and press play: the mated scene plays the whole mission end to end — deploys, the docking descent, post-mate stages — with live clearance readouts.',
+      done: () => mode === 'deploy' },
+    { text: 'When you\'re ready to hand geometry to CAD, "export STEP" (top-right) writes one AP214 file per configuration. That completes the loop: you author in plain language, the engine judges every state, you export. You\'re set — explore freely.' },
+  ];
+
+  function endTour() {
+    setTutStep(0);
+    try { window.localStorage.setItem('truss_wb_tut_v1', 'done'); } catch { /* ok */ }
+  }
+
+  // start the tour on the FIRST design a new user ever loads (once)
+  useEffect(() => {
+    if (tutStep === 0 && scenes.length > 0) {
+      let done = 'done';
+      try { done = window.localStorage.getItem('truss_wb_tut_v1') ?? ''; } catch { /* ok */ }
+      if (done !== 'done') { setTutStep(1); }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scenes.length]);
+
+  // auto-advance when the user does the thing the current step teaches
+  useEffect(() => {
+    if (tutStep < 1 || tutStep > TUT_STEPS.length) { return; }
+    const cond = TUT_STEPS[tutStep - 1].done;
+    if (cond && cond()) {
+      const t = setTimeout(() => setTutStep((s) => Math.min(s + 1, TUT_STEPS.length + 1)), 900);
+      return () => clearTimeout(t);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tutStep, mode, active, scenes.length]);
 
   async function exportStep() {
     setExporting(true);
@@ -1144,7 +1195,58 @@ export default function WorkbenchPanel() {
             {exporting ? 'exporting…' : 'export STEP'}
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => setTutStep(1)}
+          title="guided tour"
+          aria-label="guided tour"
+          className="rounded-md border border-border-medium px-2 hover:bg-surface-hover"
+        >
+          ?
+        </button>
       </div>
+      {tutStep >= 1 && tutStep <= TUT_STEPS.length && (
+        <div
+          className="rounded-md border border-blue-500/60 bg-surface-secondary p-2 text-xs"
+          data-testid="wb-tutorial"
+        >
+          <div className="mb-1 flex items-center gap-2">
+            <span className="font-semibold text-blue-500">
+              Guided tour · {tutStep}/{TUT_STEPS.length}
+            </span>
+            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={endTour}
+              className="text-text-secondary hover:text-text-primary"
+            >
+              skip
+            </button>
+          </div>
+          <div className="text-text-primary">{TUT_STEPS[tutStep - 1].text}</div>
+          <div className="mt-1.5 flex items-center gap-2">
+            {tutStep > 1 && (
+              <button
+                type="button"
+                onClick={() => setTutStep((s) => s - 1)}
+                className="rounded border border-border-medium px-2 py-0.5 hover:bg-surface-hover"
+              >
+                back
+              </button>
+            )}
+            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={() =>
+                tutStep >= TUT_STEPS.length ? endTour() : setTutStep((s) => s + 1)
+              }
+              className="rounded bg-surface-active-alt px-2.5 py-0.5 font-semibold hover:bg-surface-hover"
+            >
+              {tutStep >= TUT_STEPS.length ? 'finish' : 'next'}
+            </button>
+          </div>
+        </div>
+      )}
       {stepLinks.length > 0 && (
         <div className="rounded-md border border-border-medium p-1.5 text-xs" data-testid="wb-step-links">
           <div className="text-text-secondary">STEP files (right-click → save):</div>
