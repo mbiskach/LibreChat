@@ -1346,38 +1346,6 @@ export default function WorkbenchPanel() {
         )}
         {rated === 'sent' && <span title="feedback recorded">✓</span>}
       </div>
-      {scenes.length > 0 && (
-        <div className="flex items-center gap-1 text-xs" data-testid="wb-tabs">
-          <span className="text-text-secondary">panel:</span>
-          {(['constraints', 'deploy', 'edit'] as const).map((m) => (
-            <button
-              key={m}
-              type="button"
-              onClick={() => setMode(mode === m ? '' : m)}
-              title={
-                m === 'constraints'
-                  ? 'the engine findings grading this design, with their corpus constraint ids - click a row to outline its parts'
-                  : m === 'deploy'
-                    ? 'the deployment sequence: scrubber + clearance overlay on the view, step list in the pane'
-                    : 'pick a part, edit its dimensions - every edit re-verifies through the engine; window shows the feasible range'
-              }
-              className={
-                'rounded px-2 py-0.5 ' +
-                (mode === m
-                  ? 'bg-surface-active-alt font-semibold'
-                  : 'bg-surface-secondary hover:bg-surface-hover')
-              }
-            >
-              {m}
-              {m === 'constraints' && findings.some((f) => f.status === 'FAIL') && (
-                <span className="ml-1 text-red-500">
-                  {findings.filter((f) => f.status === 'FAIL').length}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-      )}
       <div className="flex min-h-0 flex-1 gap-2">
         <div className="flex min-w-0 flex-1 flex-col gap-2">
       {scenes.length > 0 && (
@@ -1977,6 +1945,40 @@ export default function WorkbenchPanel() {
                 </span>
               </>
             )}
+          </div>
+        )}
+        {scenes.length > 0 && (
+          <div
+            className="flex flex-shrink-0 flex-col gap-1 border-l border-border-medium pl-1 text-xs"
+            data-testid="wb-tabs"
+          >
+            {(['constraints', 'deploy', 'edit'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setMode(mode === m ? '' : m)}
+                title={
+                  m === 'constraints'
+                    ? 'the engine findings grading this design, with their corpus constraint ids - click a row to outline its parts'
+                    : m === 'deploy'
+                      ? 'the deployment sequence: scrubber + clearance overlay on the view, step list in the pane'
+                      : 'pick a part, edit its dimensions - every edit re-verifies through the engine; window shows the feasible range'
+                }
+                className={
+                  'flex flex-col items-center gap-1 rounded px-1 py-2 ' +
+                  (mode === m
+                    ? 'bg-surface-active-alt font-semibold'
+                    : 'bg-surface-secondary hover:bg-surface-hover')
+                }
+              >
+                <span style={{ writingMode: 'vertical-rl' } as any}>{m}</span>
+                {m === 'constraints' && findings.some((f) => f.status === 'FAIL') && (
+                  <span className="text-red-500">
+                    {findings.filter((f) => f.status === 'FAIL').length}
+                  </span>
+                )}
+              </button>
+            ))}
           </div>
         )}
       </div>
