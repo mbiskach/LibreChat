@@ -28,6 +28,13 @@ const ACCENT = 0xb23a2f;
 const MENTION = 0xd99a2b; // refs the model cited in its latest reply
 
 function entityDistance(THREE: any, p: any, e: any): number {
+  if (e.type === 'face' && e.center) {
+    // faces carry {center, normal} (strawman topology): distance is the
+    // perpendicular gap to the face plane, so the ray-hit face wins
+    const c = new THREE.Vector3(...e.center);
+    const n = new THREE.Vector3(...(e.normal ?? [0, 0, 1])).normalize();
+    return Math.abs(p.clone().sub(c).dot(n));
+  }
   if (e.type === 'vertex' && e.point) {
     return p.distanceTo(new THREE.Vector3(...e.point));
   }
@@ -63,6 +70,25 @@ function entityDistance(THREE: any, p: any, e: any): number {
 
 function entityOverlay(THREE: any, e: any, size: number, color: number = ACCENT): any {
   const mat = new THREE.LineBasicMaterial({ color });
+  if (e.type === 'face' && e.center) {
+    // a small disc + normal stub at the face center (faces carry no
+    // polygon at strawman fidelity, so mark the plane, not the outline)
+    const g = new THREE.Group();
+    const n = new THREE.Vector3(...(e.normal ?? [0, 0, 1])).normalize();
+    const disc = new THREE.Mesh(
+      new THREE.CircleGeometry(size * 0.05, 20),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35,
+        side: THREE.DoubleSide }),
+    );
+    disc.position.set(...(e.center as [number, number, number]));
+    disc.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    g.add(disc);
+    const tip = new THREE.Vector3(...e.center).addScaledVector(n, size * 0.06);
+    g.add(new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(...e.center), tip]), mat));
+    return g;
+  }
   if (e.type === 'vertex' && e.point) {
     const s = new THREE.Mesh(
       new THREE.SphereGeometry(size * 0.012, 12, 12),
@@ -106,7 +132,7 @@ export default function WorkbenchPanel() {
   const [scenes, setScenes] = useState<string[]>([]);
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
-  const [selMode, setSelMode] = useState<'part' | 'edge' | 'point'>('part');
+  const [selMode, setSelMode] = useState<'part' | 'face' | 'edge' | 'point'>('part');
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
   // feedback widget: shown after a tool publishes geometry; the
   // model-independent channel that calibrates the in-band record_feedback
@@ -1071,7 +1097,7 @@ export default function WorkbenchPanel() {
     const mode = c.selMode ?? 'part';
     let best: any = null;
     if (mode !== 'part') {
-      const want = mode === 'edge' ? 'edge' : 'vertex';
+      const want = mode === 'edge' ? 'edge' : mode === 'face' ? 'face' : 'vertex';
       let bestD = Infinity;
       for (const e of ud.entities || []) {
         if (e.type !== want) {
@@ -1375,7 +1401,7 @@ export default function WorkbenchPanel() {
       {scenes.length > 0 && (
         <div className="flex items-center gap-1 text-xs">
           <span className="text-text-secondary">select:</span>
-          {(['part', 'edge', 'point'] as const).map((m) => (
+          {(['part', 'face', 'edge', 'point'] as const).map((m) => (
             <button
               key={m}
               type="button"
@@ -1388,7 +1414,9 @@ export default function WorkbenchPanel() {
                   ? 'nearest corner of the clicked part (smooth solids have no corners - rims are edges)'
                   : m === 'edge'
                     ? 'nearest edge of the clicked part (incl. rims)'
-                    : 'the whole part'
+                    : m === 'face'
+                      ? 'the clicked FACE of the part (its center + outward normal)'
+                      : 'the whole part'
               }
               className={
                 'rounded px-2 py-0.5 ' +
