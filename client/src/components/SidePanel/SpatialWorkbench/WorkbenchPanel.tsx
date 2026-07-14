@@ -156,6 +156,10 @@ export default function WorkbenchPanel() {
   const [busyOp, setBusyOp] = useState('');
   // feedback layers (truss docs/layers.md): disciplines collapsed by default
   const [showL3, setShowL3] = useState(false);
+  // STEP export (blinded-persona round: the workbench had no way to get
+  // geometry OUT). Drives the export_step tool through the /op endpoint.
+  const [exporting, setExporting] = useState(false);
+  const [stepLinks, setStepLinks] = useState<Array<{ name: string; url: string; kb: number }>>([]);
 
   /** POST a whitelisted operation to the tool side-channel. The panel
    * never authors geometry: every edit is a narrow spec operation the
@@ -168,6 +172,30 @@ export default function WorkbenchPanel() {
       body: JSON.stringify({ tool, args }),
     });
     return r.json();
+  }
+
+  async function exportStep() {
+    setExporting(true);
+    setStepLinks([]);
+    try {
+      const r = await opPost('export_step', {});
+      // the tool returns lines like "- stowed.step (7 solids, 42 KB): <url>"
+      const links: Array<{ name: string; url: string; kb: number }> = [];
+      for (const ln of String(r.text ?? '').split('\n')) {
+        const m = ln.match(/^- (\S+\.step) \((\d+) solids, (\d+) KB\): (\S+)$/);
+        if (m) {
+          links.push({ name: m[1], kb: parseInt(m[3], 10), url: m[4] });
+        }
+      }
+      setStepLinks(links);
+      if (!links.length) {
+        setStatus(String(r.text ?? 'export failed').slice(0, 200));
+      }
+    } catch {
+      setStatus('STEP export failed (is a design loaded?)');
+    } finally {
+      setExporting(false);
+    }
   }
 
   // lazy corpus fetch the first time the constraints tab opens
@@ -1095,15 +1123,43 @@ export default function WorkbenchPanel() {
 
   return (
     <div className="flex h-full flex-col gap-2 p-2 text-sm text-text-primary">
-      <label className="cursor-pointer rounded-md border border-border-medium p-2 text-center hover:bg-surface-hover">
-        load glTF
-        <input
-          type="file"
-          accept=".gltf,.glb,model/gltf+json"
-          className="hidden"
-          onChange={(e) => e.target.files && e.target.files[0] && loadFile(e.target.files[0])}
-        />
-      </label>
+      <div className="flex gap-2">
+        <label className="flex-1 cursor-pointer rounded-md border border-border-medium p-2 text-center hover:bg-surface-hover">
+          load glTF
+          <input
+            type="file"
+            accept=".gltf,.glb,model/gltf+json"
+            className="hidden"
+            onChange={(e) => e.target.files && e.target.files[0] && loadFile(e.target.files[0])}
+          />
+        </label>
+        {scenes.length > 0 && (
+          <button
+            type="button"
+            disabled={exporting}
+            onClick={exportStep}
+            title="export STEP (AP214) CAD files for NX/Creo/SolidWorks - the geometry handoff out of the tool"
+            className="flex-1 rounded-md border border-border-medium p-2 text-center hover:bg-surface-hover disabled:opacity-50"
+          >
+            {exporting ? 'exporting…' : 'export STEP'}
+          </button>
+        )}
+      </div>
+      {stepLinks.length > 0 && (
+        <div className="rounded-md border border-border-medium p-1.5 text-xs" data-testid="wb-step-links">
+          <div className="text-text-secondary">STEP files (right-click → save):</div>
+          {stepLinks.map((l) => (
+            <a
+              key={l.url}
+              href={l.url}
+              download={l.name}
+              className="block truncate font-mono text-[11px] text-blue-500 hover:underline"
+            >
+              {l.name} ({l.kb} KB)
+            </a>
+          ))}
+        </div>
+      )}
       <div className="flex items-center gap-2 text-xs text-text-secondary">
         <span className="min-w-0 flex-1 truncate">{status}</span>
         {ctx.current.lastStamp != null && rated !== 'sent' && (
@@ -1428,6 +1484,11 @@ export default function WorkbenchPanel() {
               )}
               {(() => {
                 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                // failures-first WITHIN each layer group: the finding that
+                // drives DOES-NOT-FIT must never sit below a wall of green
+                // PASS rows (blinded-persona round, 2026-07-14). Stable
+                // within a severity by keeping the original index order.
+                const sev = (s: string) => (s === 'FAIL' ? 0 : s === 'WARN' ? 1 : 2);
                 const visible = findings
                   .map((f, i) => [f, i] as [any, number])
                   .filter(([f]) => showPass || f.status !== 'PASS')
@@ -1439,7 +1500,8 @@ export default function WorkbenchPanel() {
                           `${f.subject ?? ''} ${f.detail ?? ''}`,
                         ),
                       ),
-                  );
+                  )
+                  .sort((a, b) => sev(a[0].status) - sev(b[0].status) || a[1] - b[1]);
                 const row = ([f, i]: [any, number]) => (
                   <div
                     key={i}
@@ -1529,6 +1591,20 @@ export default function WorkbenchPanel() {
                 if (!findings.some((f) => f.layer != null)) {
                   return visible.map(row); // older tool server: flat list
                 }
+                // FAILURES-FIRST STRIP (blinded-persona round: the FAILs that
+                // drive DOES-NOT-FIT sat below a wall of green WARN rows, and
+                // across-group they can land under any layer). Hoist every
+                // failing finding to a strip at the very top, above the
+                // layer groups; they still appear in-group below for context.
+                const failRows = visible.filter(([f]) => f.status === 'FAIL');
+                const failStrip = failRows.length > 0 && (
+                  <div key="failstrip" className="mb-2 rounded-md border border-red-500/60 p-1" data-testid="wb-failures">
+                    <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-500">
+                      must fix — {failRows.length} failing
+                    </div>
+                    {failRows.map(row)}
+                  </div>
+                );
                 // feedback layers: geometry always in view, declared-intent
                 // next, disciplines collapsed into the maturity section
                 // (WARN = graded against placeholder data, by definition)
@@ -1540,7 +1616,7 @@ export default function WorkbenchPanel() {
                   { L: 3, label: 'disciplines (advisory)',
                     hint: 'corpus-scoped engineering checks, largely on placeholder data - the design-maturity view; click to expand' },
                 ];
-                return groups.map(({ L, label, hint }) => {
+                const groupEls = groups.map(({ L, label, hint }) => {
                   const rows = visible.filter(([f]) => (f.layer ?? 3) === L);
                   if (!rows.length) {
                     return null;
@@ -1576,6 +1652,7 @@ export default function WorkbenchPanel() {
                     </div>
                   );
                 });
+                return [failStrip, ...groupEls];
               })()}
             </div>
             <span className="text-[10px] text-text-secondary">
