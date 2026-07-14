@@ -184,8 +184,7 @@ export default function WorkbenchPanel() {
   // and (where it can) auto-advances when the user does the thing. `done`
   // reads live state; steps without `done` advance on the Next button.
   const TUT_STEPS: Array<{ text: string; done?: () => boolean }> = [
-    { text: 'Welcome. This workbench shows a spacecraft concept across its whole lifecycle in 3D. Ask the assistant to load a demo (e.g. "load the mission demo"), or load one, to begin.',
-      done: () => scenes.length > 0 },
+    { text: 'Welcome. This workbench shows a spacecraft concept across its whole lifecycle in 3D — drag to orbit it. You design in plain language in the chat; the deterministic engine checks every configuration. This 8-step tour takes about a minute.' },
     { text: 'Top-right is the ENGINE\'s verdict — FITS or DOES NOT FIT — with a "placeholder-graded" count. The chat only AUTHORS the design; the deterministic engine judges it. That split is why you can trust the verdict.' },
     { text: 'The buttons above the 3D view switch lifecycle configurations (stowed, deployed, and — for two-launch designs — pre_dock and mated). Click through them to see the concept fold, deploy, and dock.',
       done: () => active !== '' && active !== scenes[0] },
@@ -214,16 +213,28 @@ export default function WorkbenchPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenes.length]);
 
-  // auto-advance when the user does the thing the current step teaches
+  // auto-advance is EDGE-triggered: capture whether the step's condition
+  // was ALREADY satisfied when it opened, and only advance on a
+  // false->true transition. A level-triggered check advanced immediately
+  // whenever a step opened already-satisfied (starting on step 2, and
+  // double-jumping on Next). A step with no `done` never auto-advances.
+  const tutBaseRef = useRef(true);
+  useEffect(() => {
+    if (tutStep >= 1 && tutStep <= TUT_STEPS.length) {
+      const cond = TUT_STEPS[tutStep - 1].done;
+      tutBaseRef.current = cond ? cond() : true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tutStep]);
   useEffect(() => {
     if (tutStep < 1 || tutStep > TUT_STEPS.length) { return; }
     const cond = TUT_STEPS[tutStep - 1].done;
-    if (cond && cond()) {
-      const t = setTimeout(() => setTutStep((s) => Math.min(s + 1, TUT_STEPS.length + 1)), 900);
+    if (cond && !tutBaseRef.current && cond()) {
+      const t = setTimeout(() => setTutStep((s) => Math.min(s + 1, TUT_STEPS.length + 1)), 700);
       return () => clearTimeout(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tutStep, mode, active, scenes.length]);
+  }, [mode, active, scenes.length]);
 
   async function exportStep() {
     setExporting(true);
