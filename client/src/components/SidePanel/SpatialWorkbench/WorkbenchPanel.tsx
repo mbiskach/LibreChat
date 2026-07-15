@@ -210,18 +210,19 @@ export default function WorkbenchPanel() {
   // and (where it can) auto-advances when the user does the thing. `done`
   // reads live state; steps without `done` advance on the Next button.
   const TUT_STEPS: Array<{ text: string; done?: () => boolean }> = [
-    { text: 'Welcome. This workbench shows a spacecraft concept across its whole lifecycle in 3D — drag to orbit it. You design in plain language in the chat; the deterministic engine checks every configuration. This 8-step tour takes about a minute.' },
-    { text: 'Top-right is the ENGINE\'s verdict — FITS or DOES NOT FIT — with a "placeholder-graded" count. The chat only AUTHORS the design; the deterministic engine judges it. That split is why you can trust the verdict.' },
-    { text: 'The buttons above the 3D view switch lifecycle configurations (stowed, deployed, and — for two-launch designs — pre_dock and mated). Click through them to see the concept fold, deploy, and dock.',
+    { text: 'Welcome. This workbench shows a spacecraft concept across its whole lifecycle in 3D — drag to orbit it. You design in plain language in the chat; the deterministic engine checks every configuration. This 9-step tour takes about a minute.' },
+    { text: 'Top-right is the ENGINE\'s verdict — FITS or DOES NOT FIT — with a "placeholder-graded" count (findings checked against stand-in data, not yet SME-verified — more on that shortly). The chat only AUTHORS the design; the deterministic engine judges it. That split is why you can trust the verdict.' },
+    { text: 'The buttons above the 3D view switch lifecycle configurations — stowed, deployed, and (for two-launch designs) pre_dock and mated. These folds and deployments came from motions someone DESCRIBED in the chat — they are not fixed demo states. Click through to watch them, then you\'ll author your own.',
       done: () => active !== '' && active !== scenes[0] },
+    { text: 'Now make your own motion. In the chat, type: "add an instrument boom that folds flat against the bus for launch and swings out 90° when deployed." Watch a new part appear and animate across the stowed→deployed buttons — you described intent in plain English and the engine BUILT and swept the motion. That is the difference between a viewer and a workbench.' },
     { text: 'Open the CONSTRAINTS tab. Findings group by layer: geometry (true at any scale), declared intent (optics/motion you declared), and disciplines (advisory). Any FAILURE is hoisted to the red "must fix" strip on top.',
       done: () => mode === 'constraints' },
-    { text: 'Notice every fairing fit says "needs SME verification" — those envelopes are PLACEHOLDER data. The honest rule: trust the relative margins and what\'s driving them, verify the absolute numbers with a real envelope. Click a finding to outline its parts.' },
-    { text: 'Open the EDIT tab, pick a part in the 3D view, and change a dimension. The engine RE-VERIFIES — nothing is moved by hand. The "window" button sweeps a dimension and shows the feasible range, so a red X becomes an actionable window.',
+    { text: 'Notice every fairing fit says "needs SME verification" — those are the PLACEHOLDER envelopes the badge counted. The honest rule: trust the relative margins and what\'s driving them, verify the absolute numbers with a real envelope. Click a finding to outline its parts.' },
+    { text: 'The EDIT tab fine-tunes NUMBERS: pick a part in the 3D view, change a dimension, and the engine RE-VERIFIES — nothing is moved by hand. (Chat ADDS and composes parts and their motion; Edit tunes what is already there.) The "window" button sweeps a dimension and shows its feasible range, so a red X becomes an actionable window.',
       done: () => mode === 'edit' },
     { text: 'Open the DEPLOY tab and press play: the mated scene plays the whole mission end to end — deploys, the docking descent, post-mate stages — with live clearance readouts.',
       done: () => mode === 'deploy' },
-    { text: 'When you\'re ready to hand geometry to CAD, "export STEP" (top-right) writes one AP214 file per configuration. That completes the loop: you author in plain language, the engine judges every state, you export. You\'re set — explore freely.' },
+    { text: 'When you\'re ready to hand geometry to CAD, "export STEP" (top-right) writes one AP214 file per configuration — you author in plain language, the engine judges every state, you export. Your turn: try typing "add a deployable sunshade that unfolds in the deployed configuration" and watch it build.' },
   ];
 
   function endTour() {
