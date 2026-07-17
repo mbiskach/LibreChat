@@ -135,6 +135,42 @@ function entityOverlay(THREE: any, e: any, size: number, color: number = ACCENT)
 const HOVER = 0x38bdf8; // sky-400: distinct from ACCENT (pick) / MENTION (reply)
 const AUTO_TOL_PT_PX = 14;
 const AUTO_TOL_EDGE_PX = 9;
+// count-like dimensions the engine keeps integer (>=1): the number field
+// steps by 1 and floors at 1 instead of drifting them to floats
+const INT_DIMS = new Set(['rings', 'segments', 'n_sides']);
+
+// A small world-axis indicator (X red / Y green / Z blue) drawn as an
+// overlay in the lower-left corner. Built once; its camera tracks the main
+// camera each frame, so it always reads "which way is world +X/+Y/+Z" - the
+// domain worlds are z-up, which is easy to lose after a few orbits.
+function makeAxisGizmo(THREE: any): { scene: any; cam: any } {
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AxesHelper(1));
+  const label = (text: string, color: string, pos: [number, number, number]) => {
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = 64;
+    const g = cv.getContext('2d');
+    if (g) {
+      g.fillStyle = color;
+      g.font = 'bold 44px sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(text, 32, 32);
+    }
+    const sp = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(cv), depthTest: false }),
+    );
+    sp.position.set(...pos);
+    sp.scale.set(0.6, 0.6, 0.6);
+    return sp;
+  };
+  scene.add(label('X', '#ff6b6b', [1.35, 0, 0]));
+  scene.add(label('Y', '#51cf66', [0, 1.35, 0]));
+  scene.add(label('Z', '#5c9dff', [0, 0, 1.35]));
+  const cam = new THREE.OrthographicCamera(-1.8, 1.8, 1.8, -1.8, 0.1, 10);
+  cam.up.set(0, 0, 1);
+  return { scene, cam };
+}
 
 function projectPx(THREE: any, v: any, camera: any, rect: DOMRect): [number, number] | null {
   const p = v.clone().project(camera);
@@ -507,6 +543,10 @@ export default function WorkbenchPanel() {
     const r = await opPost('add_part', args);
     setBusyOp('');
     setOpStatus(r.text.split('\n')[0]);
+    if (r.ok) {
+      // tell the assistant an id it did not author now exists in the design
+      noteToComposer(`[workbench: added part ${String(args.name)} (${kind})]`);
+    }
   }
 
   // remove the selected part. Refused by the engine (readable message) if
@@ -516,11 +556,13 @@ export default function WorkbenchPanel() {
     if (!dims?.component) {
       return;
     }
+    const name = dims.component;
     setBusyOp('del');
-    const r = await opPost('remove_part', { name: dims.component });
+    const r = await opPost('remove_part', { name });
     setBusyOp('');
     setOpStatus(r.text.split('\n')[0]);
     if (r.ok) {
+      noteToComposer(`[workbench: removed part ${name}]`);
       setPicks([]);
       setDims(null);
     }
@@ -626,6 +668,7 @@ export default function WorkbenchPanel() {
           c.camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
           c.camera.up.set(0, 0, 1); // domain worlds are z-up
           c.controls = new OrbitControls(c.camera, c.renderer.domElement);
+          c.gizmo = makeAxisGizmo(THREE); // lower-left world-axis indicator
           const fit = () => {
             const w = el.clientWidth || 300;
             const h = Math.max(el.clientHeight, 260);
@@ -699,6 +742,32 @@ export default function WorkbenchPanel() {
             if (c.scene) {
               c.controls.update();
               c.renderer.render(c.scene, c.camera);
+              if (c.gizmo) {
+                // second pass: a small corner viewport whose ortho camera
+                // shares the main camera's orientation. autoClear off + a
+                // scissored depth clear keeps the main scene intact and
+                // draws the axes on top only inside the corner box.
+                const sz = c.renderer.getSize(new THREE.Vector2());
+                const gs = Math.round(Math.min(96, Math.max(64, sz.x * 0.22)));
+                const m = 10;
+                const g = c.gizmo;
+                g.cam.position
+                  .copy(c.camera.position)
+                  .sub(c.controls.target)
+                  .normalize()
+                  .multiplyScalar(4);
+                g.cam.up.copy(c.camera.up);
+                g.cam.lookAt(0, 0, 0);
+                c.renderer.autoClear = false;
+                c.renderer.setScissorTest(true);
+                c.renderer.setViewport(m, m, gs, gs);
+                c.renderer.setScissor(m, m, gs, gs);
+                c.renderer.clearDepth();
+                c.renderer.render(g.scene, g.cam);
+                c.renderer.setScissorTest(false);
+                c.renderer.setViewport(0, 0, sz.x, sz.y);
+                c.renderer.autoClear = true;
+              }
             }
           };
           loop();
@@ -1468,6 +1537,22 @@ export default function WorkbenchPanel() {
 
   const methods = useChatFormContext();
 
+  /** Drop a short, model-legible note into the composer when the panel
+   * edits the live design out-of-band (add/delete part). The engine state
+   * is already updated - this only closes the CHAT-context gap so the
+   * assistant's next turn knows the part exists (and by what id). Visible
+   * and deletable, exactly like a selection token. */
+  function noteToComposer(note: string) {
+    if (!methods) {
+      return;
+    }
+    const cur = (methods.getValues('text') as string) ?? '';
+    methods.setValue('text', (cur ? cur.trimEnd() + ' ' : '') + note + ' ', {
+      shouldValidate: true,
+      shouldDirty: true,
+    });
+  }
+
   /** Append ONE reference token to the composer (the double-click path). */
   function insertOneRef(rec: PickEntry) {
     if (!methods) {
@@ -2219,7 +2304,8 @@ export default function WorkbenchPanel() {
                         <span className="min-w-0 flex-1 truncate font-mono">{p}</span>
                         <input
                           type="number"
-                          step="0.05"
+                          step={INT_DIMS.has(p) ? '1' : '0.05'}
+                          min={INT_DIMS.has(p) ? '1' : undefined}
                           value={dimEdits[p] ?? ''}
                           onChange={(e) =>
                             setDimEdits({ ...dimEdits, [p]: e.target.value })
