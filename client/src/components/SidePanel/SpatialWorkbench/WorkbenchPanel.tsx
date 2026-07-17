@@ -362,6 +362,52 @@ export default function WorkbenchPanel() {
     }
   }
 
+  // add a starter primitive with sane defaults, then tune it in the dims
+  // panel; the engine re-packs + re-verifies and the /latest.json poll
+  // reloads the scene. add_part is the SAME verb the assistant uses.
+  async function addPrimitive(kind: 'box' | 'fold' | 'mosaic') {
+    const suffix = Date.now().toString(36).slice(-4);
+    const args: Record<string, unknown> =
+      kind === 'box'
+        ? { name: `part_${suffix}`, kind: 'box', size: [1, 1, 0.3] }
+        : kind === 'fold'
+          ? {
+              name: `array_${suffix}`,
+              fold: { span_m: 3, width_m: 1.2, thickness_m: 0.05, segments: 4, gap_m: 0.02 },
+            }
+          : {
+              name: `mirror_${suffix}`,
+              mosaic: {
+                rings: 1,
+                segment_across_flats: 1.3,
+                gap_mm: 6,
+                thickness_m: 0.2,
+                radius_of_curvature_m: 16,
+              },
+            };
+    setBusyOp('add:' + kind);
+    const r = await opPost('add_part', args);
+    setBusyOp('');
+    setOpStatus(r.text.split('\n')[0]);
+  }
+
+  // remove the selected part. Refused by the engine (readable message) if
+  // another part/constraint still references it; on success the selection
+  // is cleared and the scene reloads via the poll.
+  async function deletePart() {
+    if (!dims?.component) {
+      return;
+    }
+    setBusyOp('del');
+    const r = await opPost('remove_part', { name: dims.component });
+    setBusyOp('');
+    setOpStatus(r.text.split('\n')[0]);
+    if (r.ok) {
+      setPicks([]);
+      setDims(null);
+    }
+  }
+
   async function sendFeedback(rating: number, comment?: string) {
     const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
     try {
@@ -1921,10 +1967,29 @@ export default function WorkbenchPanel() {
             className="flex w-64 flex-shrink-0 flex-col gap-1 overflow-hidden rounded-md border border-border-medium p-1.5 text-xs"
             data-testid="wb-edit-pane"
           >
+            <div className="flex items-center gap-1 border-b border-border-medium pb-1.5">
+              <span className="mr-auto text-[10px] uppercase tracking-wide text-text-secondary">
+                add part
+              </span>
+              {(['box', 'fold', 'mosaic'] as const).map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  disabled={busyOp !== ''}
+                  onClick={() => addPrimitive(k)}
+                  title={`add a starter ${k} with default dimensions, then tune it below`}
+                  className="rounded bg-surface-secondary px-1.5 py-0.5 hover:bg-surface-hover disabled:opacity-50"
+                  data-testid={`wb-add-${k}`}
+                >
+                  {busyOp === 'add:' + k ? '…' : `+ ${k}`}
+                </button>
+              ))}
+            </div>
             {!editTarget ? (
               <span className="text-text-secondary">
-                pick a part in the viewport to edit its dimensions - every
-                edit re-verifies through the engine, nothing is moved by hand
+                pick a part in the viewport to edit or delete it, or add one
+                above - every edit re-verifies through the engine, nothing is
+                moved by hand
               </span>
             ) : !dims ? (
               <span className="text-text-secondary">
@@ -1932,7 +1997,19 @@ export default function WorkbenchPanel() {
               </span>
             ) : (
               <>
-                <span className="font-semibold">{dims.component}</span>
+                <div className="flex items-center gap-1">
+                  <span className="mr-auto truncate font-semibold">{dims.component}</span>
+                  <button
+                    type="button"
+                    disabled={busyOp !== ''}
+                    onClick={deletePart}
+                    title="remove this part and re-verify (refused if another part still references it)"
+                    className="rounded px-1.5 py-0.5 text-red-500 hover:bg-red-500/10 disabled:opacity-50"
+                    data-testid="wb-delete-part"
+                  >
+                    {busyOp === 'del' ? '…' : 'delete'}
+                  </button>
+                </div>
                 <div className="min-h-0 flex-1 overflow-y-auto">
                   {Object.entries(dims.dims ?? {}).map(([p, v]) => (
                     <div key={p} className="mb-1.5">
