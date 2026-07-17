@@ -151,14 +151,17 @@ export default function WorkbenchPanel() {
   // list, click to jump
   const [steps, setSteps] = useState<
     Array<{ label: string; component: string; w0: number; w1: number;
-            jumpT: number; clear: number | null; color: string }>
+            jumpT: number; clear: number | null; color: string;
+            members?: string[] }>
   >([]);
   const [stripBg, setStripBg] = useState('');
   const [interferences, setInterferences] = useState<Array<[number, number, string]>>([]);
   const [ghost, setGhost] = useState(false);
   // one color per major system (from glTF extras.system/system_color -
   // twins and mosaic segments share their subsystem's color)
-  const [legend, setLegend] = useState<Array<{ system: string; color: string }>>([]);
+  const [legend, setLegend] = useState<
+    Array<{ system: string; color: string; kind?: string; count: number }>
+  >([]);
   // UI-refresh spike: tabs are MODES. The viewport stays visible always;
   // the active mode contributes a side data pane (constraints: the
   // engine's findings with corpus ids; deploy: the step list) and, for
@@ -578,6 +581,11 @@ export default function WorkbenchPanel() {
 
     const seen = new Map<string, string>();
     const compColor = new Map<string, string>();
+    // logical-unit grouping (engine extras.unit = {id, kind}): a generator's
+    // members (fold panels, mosaic segments) collapse to ONE legend entry and
+    // ONE deployment row instead of N loose parts.
+    const compUnit = new Map<string, { id: string; kind?: string }>();
+    const unitMeta = new Map<string, { kind?: string; count: number }>();
     scene.traverse((o: any) => {
       const ud = o.userData || {};
       if (ud.system && ud.system_color && !ud.envelope) {
@@ -586,11 +594,28 @@ export default function WorkbenchPanel() {
         }
         if (ud.id) {
           compColor.set(ud.id, ud.system_color);
+          if (ud.unit && ud.unit.id) {
+            compUnit.set(ud.id, ud.unit);
+          }
         }
+        const meta = unitMeta.get(ud.system) || { count: 0 };
+        meta.count += 1;
+        if (ud.unit && ud.unit.kind) {
+          meta.kind = ud.unit.kind;
+        }
+        unitMeta.set(ud.system, meta);
       }
     });
-    setLegend([...seen.entries()].map(([system, color]) => ({ system, color })));
+    setLegend(
+      [...seen.entries()].map(([system, color]) => ({
+        system,
+        color,
+        kind: unitMeta.get(system)?.kind,
+        count: unitMeta.get(system)?.count ?? 1,
+      })),
+    );
     c.compColor = compColor;
+    c.compUnit = compUnit;
 
     // deployment: per-t clearance curves ride the scene extras; the
     // animation (if any) is named after the scene label
@@ -665,7 +690,50 @@ export default function WorkbenchPanel() {
         };
       })
       .sort((a, b) => a.w0 - b.w0);
-    setSteps(rows);
+    // collapse a deployable unit's member steps into ONE row (the panels of
+    // a solar array deploy together - show them as one assembly, not N rows)
+    type Step = (typeof rows)[number] & { members?: string[] };
+    const compUnit: Map<string, { id: string; kind?: string }> =
+      c.compUnit ?? new Map();
+    const groups = new Map<string, Step[]>();
+    const collapsed: Step[] = [];
+    for (const r of rows) {
+      const u = compUnit.get(r.component);
+      if (u?.id) {
+        if (!groups.has(u.id)) {
+          groups.set(u.id, []);
+        }
+        groups.get(u.id)!.push(r);
+      } else {
+        collapsed.push(r);
+      }
+    }
+    for (const [unitId, members] of groups) {
+      if (members.length === 1) {
+        collapsed.push(members[0]);
+        continue;
+      }
+      const anyIntersect = members.some((m) => m.clear == null);
+      const clear = anyIntersect
+        ? null
+        : Math.min(...members.map((m) => m.clear as number));
+      const tight = anyIntersect
+        ? members.find((m) => m.clear == null)!
+        : members.reduce((a, b) => ((a.clear as number) <= (b.clear as number) ? a : b));
+      const kind = compUnit.get(members[0].component)?.kind ?? 'unit';
+      collapsed.push({
+        label: `${unitId} · ${members.length}-panel ${kind}`,
+        component: unitId,
+        members: members.map((m) => m.component),
+        w0: Math.min(...members.map((m) => m.w0)),
+        w1: Math.max(...members.map((m) => m.w1)),
+        jumpT: tight.jumpT,
+        clear,
+        color: members[0].color,
+      });
+    }
+    collapsed.sort((a, b) => a.w0 - b.w0);
+    setSteps(collapsed);
   }
 
   function stopPlay() {
@@ -1505,7 +1573,12 @@ export default function WorkbenchPanel() {
                 className="inline-block h-2.5 w-2.5 rounded-sm"
                 style={{ background: l.color }}
               />
-              <span className="text-text-secondary">{l.system}</span>
+              <span className="text-text-secondary">
+                {l.system}
+                {l.kind && l.count > 1 && (
+                  <span className="text-text-tertiary"> ·{l.count} {l.kind}</span>
+                )}
+              </span>
             </span>
           ))}
         </div>
@@ -1789,7 +1862,8 @@ export default function WorkbenchPanel() {
                     const stepActive = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
                     const dot =
                       s.clear == null ? '#dc2626' : s.clear < 0.15 ? '#d97706' : '#57755a';
-                    const picked = picks.some((p) => p.component === s.component);
+                    const stepIds = s.members ?? [s.component];
+                    const picked = picks.some((p) => stepIds.includes(p.component));
                     return (
                       <button
                         key={s.label + i}
@@ -1798,7 +1872,7 @@ export default function WorkbenchPanel() {
                           stopPlay();
                           scrubDeploy(s.jumpT);
                           // cross-tab sync: outline the moving part
-                          ctx.current.findingSel = { ids: [s.component], color: ACCENT };
+                          ctx.current.findingSel = { ids: stepIds, color: ACCENT };
                           setFindingIx(-1);
                           rebuildFindingOverlay();
                         }}
