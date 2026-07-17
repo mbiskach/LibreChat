@@ -281,6 +281,9 @@ export default function WorkbenchPanel() {
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
   const [selMode, setSelMode] = useState<'auto' | 'part' | 'face' | 'edge' | 'point'>('auto');
+  // when set, the panel is in "pick a face to mount this fold" mode: the next
+  // face click on another part fires mate_to_face (erecting accordion)
+  const [mateFrom, setMateFrom] = useState<string | null>(null);
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
   // feedback widget: shown after a tool publishes geometry; the
   // model-independent channel that calibrates the in-band record_feedback
@@ -482,6 +485,24 @@ export default function WorkbenchPanel() {
     ctx.current.selMode = selMode;
   }, [selMode]);
 
+  // the pointer listeners are bound once and read ctx.current, so mirror the
+  // mate-mode flag there; Escape cancels the pending mount
+  useEffect(() => {
+    ctx.current.mateFrom = mateFrom;
+    if (!mateFrom) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMateFrom(null);
+        ctx.current.mateFrom = null;
+        setOpStatus('mount cancelled');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mateFrom]);
+
   async function applyDim(param: string) {
     const v = parseFloat(dimEdits[param]);
     if (!isFinite(v)) {
@@ -565,6 +586,31 @@ export default function WorkbenchPanel() {
       noteToComposer(`[workbench: removed part ${name}]`);
       setPicks([]);
       setDims(null);
+    }
+  }
+
+  // enter "pick a face" mode: the next face click on ANOTHER part mounts this
+  // fold's root to it as an erecting accordion (stows flat against the face,
+  // deploys out along its normal). Snap the selector to faces + hint.
+  function mateToFace(child: string) {
+    setMateFrom(child);
+    setSelMode('face');
+    ctx.current.selMode = 'face';
+    setOpStatus(`click a FACE on another part to mount ${child} (Esc to cancel)`);
+  }
+
+  async function doMateToFace(child: string, target: string, face: string) {
+    setBusyOp('mate');
+    const r = await opPost('mate_to_face', { child, target, face });
+    setBusyOp('');
+    setMateFrom(null);
+    ctx.current.mateFrom = null;
+    setOpStatus(r.text.split('\n')[0]);
+    if (r.ok) {
+      noteToComposer(
+        `[workbench: mounted ${child} to ${target}.${face} as an erecting ` +
+          `accordion - stows flat, deploys out along the face normal]`,
+      );
     }
   }
 
@@ -1504,6 +1550,18 @@ export default function WorkbenchPanel() {
   }
 
   function pick(ev: PointerEvent) {
+    // mount mode: consume the click as a face pick for mate_to_face instead
+    // of a normal selection (bound listener reads the flag off ctx.current)
+    const mf = ctx.current.mateFrom as string | null;
+    if (mf) {
+      const h = resolveHit(ev);
+      if (h && h.entity && h.entity.includes('face(') && h.component !== mf) {
+        doMateToFace(mf, h.component, h.entity);
+      } else {
+        setOpStatus(`click a FACE on another part to mount ${mf} (Esc to cancel)`);
+      }
+      return;
+    }
     const append = ev.ctrlKey || ev.shiftKey || ev.metaKey;
     const rec = resolvePick(ev);
     if (!rec) {
@@ -2286,6 +2344,30 @@ export default function WorkbenchPanel() {
               <>
                 <div className="flex items-center gap-1">
                   <span className="mr-auto truncate font-semibold">{dims.component}</span>
+                  {'segments' in (dims.dims ?? {}) && (
+                    <button
+                      type="button"
+                      disabled={busyOp !== ''}
+                      onClick={() =>
+                        mateFrom === dims.component
+                          ? (setMateFrom(null), (ctx.current.mateFrom = null))
+                          : mateToFace(dims.component)
+                      }
+                      title="mount this array's root to a face you pick: it stows flat against the face and deploys out along its normal (erecting accordion)"
+                      className={`rounded px-1.5 py-0.5 disabled:opacity-50 ${
+                        mateFrom === dims.component
+                          ? 'bg-sky-500/20 text-sky-400'
+                          : 'hover:bg-surface-hover'
+                      }`}
+                      data-testid="wb-mate-to-face"
+                    >
+                      {busyOp === 'mate'
+                        ? '…'
+                        : mateFrom === dims.component
+                          ? 'pick a face…'
+                          : 'mate to face'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     disabled={busyOp !== ''}
@@ -2297,6 +2379,13 @@ export default function WorkbenchPanel() {
                     {busyOp === 'del' ? '…' : 'delete'}
                   </button>
                 </div>
+                {mateFrom === dims.component && (
+                  <span className="rounded bg-sky-500/10 px-1.5 py-1 text-[11px] text-sky-400">
+                    click a <b>face</b> on the bus (or any other part) to mount{' '}
+                    {dims.component} to it — it will stow flat and deploy out
+                    along that face's normal. Esc to cancel.
+                  </span>
+                )}
                 <div className="min-h-0 flex-1 overflow-y-auto">
                   {Object.entries(dims.dims ?? {}).map(([p, v]) => (
                     <div key={p} className="mb-1.5">
