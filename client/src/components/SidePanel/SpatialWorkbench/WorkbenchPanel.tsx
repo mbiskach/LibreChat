@@ -126,13 +126,125 @@ function entityOverlay(THREE: any, e: any, size: number, color: number = ACCENT)
   return new THREE.Line(geo, mat);
 }
 
+// --- auto selector: screen-space arbitration ------------------------------
+// The `auto` mode snaps to the closest FEATURE under the cursor with CAD
+// priority (vertex > edge > face) using PIXEL tolerances - world distance
+// alone would always favor the face the ray already lies on. Vertices and
+// edges compete in screen space; the face is the fallback (nearest by the
+// plane gap the ray hit).
+const HOVER = 0x38bdf8; // sky-400: distinct from ACCENT (pick) / MENTION (reply)
+const AUTO_TOL_PT_PX = 14;
+const AUTO_TOL_EDGE_PX = 9;
+
+function projectPx(THREE: any, v: any, camera: any, rect: DOMRect): [number, number] | null {
+  const p = v.clone().project(camera);
+  if (p.z > 1) {
+    return null; // behind the camera / beyond the far plane
+  }
+  return [(p.x * 0.5 + 0.5) * rect.width, (-p.y * 0.5 + 0.5) * rect.height];
+}
+
+function segPxDist(pt: [number, number], a: [number, number], b: [number, number]): number {
+  const abx = b[0] - a[0];
+  const aby = b[1] - a[1];
+  const len2 = abx * abx + aby * aby;
+  let t = len2 ? ((pt[0] - a[0]) * abx + (pt[1] - a[1]) * aby) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(pt[0] - (a[0] + t * abx), pt[1] - (a[1] + t * aby));
+}
+
+function edgeWorldPts(THREE: any, e: any): any[] {
+  if (e.poly) {
+    return e.poly.map((q: number[]) => new THREE.Vector3(...q));
+  }
+  if (e.circle) {
+    const c = new THREE.Vector3(...e.circle.center);
+    const axis = new THREE.Vector3(...e.circle.axis).normalize();
+    const u = new THREE.Vector3(1, 0, 0);
+    if (Math.abs(u.dot(axis)) > 0.9) {
+      u.set(0, 1, 0);
+    }
+    const e1 = u.clone().cross(axis).normalize();
+    const e2 = axis.clone().cross(e1).normalize();
+    const out: any[] = [];
+    for (let i = 0; i <= 48; i++) {
+      const t = (2 * Math.PI * i) / 48;
+      out.push(
+        c
+          .clone()
+          .addScaledVector(e1, e.circle.radius * Math.cos(t))
+          .addScaledVector(e2, e.circle.radius * Math.sin(t)),
+      );
+    }
+    return out;
+  }
+  return [];
+}
+
+/** The feature `auto` picks under the cursor: nearest vertex (px) if within
+ * tolerance, else nearest edge (px) if within tolerance, else nearest face
+ * by plane gap, else null (whole part). */
+function autoPick(
+  THREE: any,
+  entities: any[],
+  hitPoint: any,
+  cursorPx: [number, number],
+  camera: any,
+  rect: DOMRect,
+): any {
+  let bv: any = null;
+  let bvd = Infinity;
+  let be: any = null;
+  let bed = Infinity;
+  let bf: any = null;
+  let bfd = Infinity;
+  for (const e of entities || []) {
+    if (e.type === 'vertex' && e.point) {
+      const q = projectPx(THREE, new THREE.Vector3(...e.point), camera, rect);
+      if (q) {
+        const d = Math.hypot(q[0] - cursorPx[0], q[1] - cursorPx[1]);
+        if (d < bvd) {
+          bvd = d;
+          bv = e;
+        }
+      }
+    } else if (e.type === 'edge') {
+      const wp = edgeWorldPts(THREE, e);
+      const px = wp.map((v: any) => projectPx(THREE, v, camera, rect));
+      for (let i = 0; i + 1 < px.length; i++) {
+        if (!px[i] || !px[i + 1]) {
+          continue;
+        }
+        const d = segPxDist(cursorPx, px[i], px[i + 1]);
+        if (d < bed) {
+          bed = d;
+          be = e;
+        }
+      }
+    } else if (e.type === 'face' && e.center) {
+      const d = entityDistance(THREE, hitPoint, e);
+      if (d < bfd) {
+        bfd = d;
+        bf = e;
+      }
+    }
+  }
+  if (bv && bvd <= AUTO_TOL_PT_PX) {
+    return bv;
+  }
+  if (be && bed <= AUTO_TOL_EDGE_PX) {
+    return be;
+  }
+  return bf;
+}
+
 export default function WorkbenchPanel() {
   const mountRef = useRef<HTMLDivElement>(null);
   const ctx = useRef<any>({});
   const [scenes, setScenes] = useState<string[]>([]);
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
-  const [selMode, setSelMode] = useState<'part' | 'face' | 'edge' | 'point'>('part');
+  const [selMode, setSelMode] = useState<'auto' | 'part' | 'face' | 'edge' | 'point'>('auto');
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
   // feedback widget: shown after a tool publishes geometry; the
   // model-independent channel that calibrates the in-band record_feedback
@@ -327,6 +439,12 @@ export default function WorkbenchPanel() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, editTarget]);
+
+  // keep the ref (read by the pointer listeners) in sync from mount, so the
+  // 'auto' default is live before any selector button is clicked
+  useEffect(() => {
+    ctx.current.selMode = selMode;
+  }, [selMode]);
 
   async function applyDim(param: string) {
     const v = parseFloat(dimEdits[param]);
@@ -529,6 +647,35 @@ export default function WorkbenchPanel() {
               pick(ev);
             }
           });
+          // hover preview: highlight the feature under the cursor (mouse
+          // only; suppressed while a button is down so it never fights the
+          // orbit drag). Throttled to one resolve per animation frame.
+          c.renderer.domElement.addEventListener('pointermove', (ev: PointerEvent) => {
+            if (ev.pointerType && ev.pointerType !== 'mouse') {
+              return;
+            }
+            if (ev.buttons !== 0) {
+              clearHover(); // orbiting / dragging
+              return;
+            }
+            c.lastHoverEv = ev;
+            if (c.hoverRaf) {
+              return;
+            }
+            c.hoverRaf = requestAnimationFrame(() => {
+              c.hoverRaf = 0;
+              if (c.lastHoverEv) {
+                showHover(c.lastHoverEv);
+              }
+            });
+          });
+          c.renderer.domElement.addEventListener('pointerleave', () => {
+            if (c.hoverRaf) {
+              cancelAnimationFrame(c.hoverRaf);
+              c.hoverRaf = 0;
+            }
+            clearHover();
+          });
           // double-click a feature -> reference it straight into the chat
           // (per the active selector: part / edge / point). No "-> message"
           // step needed; each double-click appends one reference.
@@ -603,6 +750,7 @@ export default function WorkbenchPanel() {
   function showScene(label: string) {
     const c = ctx.current;
     const THREE = c.THREE;
+    clearHover(); // drop any hover highlight bound to the outgoing scene
     const scene = sceneByLabel(label);
     if (!scene.userData._lit) {
       scene.add(new THREE.AmbientLight(0xffffff, 1.1));
@@ -1181,9 +1329,13 @@ export default function WorkbenchPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Raycast the cursor to a PickEntry per the active selector mode
-   * (part / edge / point), or null if nothing under it. */
-  function resolvePick(ev: PointerEvent): PickEntry | null {
+  /** Raycast the cursor to the hit component and the resolved sub-entity
+   * per the active selector mode. Returns the entity OBJECT (for overlays)
+   * plus the hit node, or null if nothing is under the cursor. Shared by
+   * committing picks (resolvePick) and hover preview (showHover). */
+  function resolveHit(
+    ev: PointerEvent,
+  ): { component: string; entity: string | null; entityObj: any; node: any } | null {
     const c = ctx.current;
     const THREE = c.THREE;
     if (!c.scene) {
@@ -1205,13 +1357,16 @@ export default function WorkbenchPanel() {
     }
     const hit = hits[0];
     const ud = hit.object.userData;
-    // the selector tool decides granularity: part = the component;
-    // edge/point = the NEAREST canonical entity of that kind on the hit
-    // component (explicit modes, so selection is deterministic - no
-    // guessing whether a click was "close enough" to an edge)
-    const mode = c.selMode ?? 'part';
+    // the selector tool decides granularity: part = the component; auto =
+    // the closest FEATURE (vertex > edge > face) by pixel tolerance;
+    // face/edge/point = the NEAREST canonical entity of THAT kind (explicit
+    // override, deterministic).
+    const mode = c.selMode ?? 'auto';
     let best: any = null;
-    if (mode !== 'part') {
+    if (mode === 'auto') {
+      const cursorPx: [number, number] = [ev.clientX - rect.left, ev.clientY - rect.top];
+      best = autoPick(THREE, ud.entities || [], hit.point, cursorPx, c.camera, rect);
+    } else if (mode !== 'part') {
       const want = mode === 'edge' ? 'edge' : mode === 'face' ? 'face' : 'vertex';
       let bestD = Infinity;
       for (const e of ud.entities || []) {
@@ -1225,13 +1380,58 @@ export default function WorkbenchPanel() {
         }
       }
     }
-    const entity = best ? (best.id as string) : null;
     return {
-      ref: ud.id + (entity ? '.' + entity : ''),
       component: ud.id,
-      entity,
-      scene: c.activeLabel,
+      entity: best ? (best.id as string) : null,
+      entityObj: best,
+      node: hit.object,
     };
+  }
+
+  /** Raycast the cursor to a committed PickEntry, or null. */
+  function resolvePick(ev: PointerEvent): PickEntry | null {
+    const h = resolveHit(ev);
+    if (!h) {
+      return null;
+    }
+    return {
+      ref: h.component + (h.entity ? '.' + h.entity : ''),
+      component: h.component,
+      entity: h.entity,
+      scene: ctx.current.activeLabel,
+    };
+  }
+
+  function clearHover() {
+    const c = ctx.current;
+    if (c.hoverOverlay && c.hoverOverlay.parent) {
+      c.hoverOverlay.parent.remove(c.hoverOverlay);
+    }
+    c.hoverOverlay = null;
+  }
+
+  /** Transient HOVER-colored highlight of the feature under the cursor -
+   * a separate overlay from picks (c.overlay) and findings, redrawn each
+   * move and cleared on leave / drag / scene change. */
+  function showHover(ev: PointerEvent) {
+    const c = ctx.current;
+    const THREE = c.THREE;
+    clearHover();
+    if (!c.scene) {
+      return;
+    }
+    const h = resolveHit(ev);
+    if (!h) {
+      return;
+    }
+    const g = new THREE.Group();
+    if (h.entityObj) {
+      g.add(entityOverlay(THREE, h.entityObj, c.sceneSize, HOVER));
+    } else {
+      g.add(new THREE.Box3Helper(new THREE.Box3().setFromObject(h.node), HOVER));
+    }
+    c.scene.add(g);
+    c.hoverOverlay = g;
   }
 
   function pick(ev: PointerEvent) {
@@ -1484,7 +1684,7 @@ export default function WorkbenchPanel() {
       {scenes.length > 0 && (
         <div className="flex items-center gap-1 text-xs">
           <span className="text-text-secondary">select:</span>
-          {(['part', 'face', 'edge', 'point'] as const).map((m) => (
+          {(['auto', 'part', 'face', 'edge', 'point'] as const).map((m) => (
             <button
               key={m}
               type="button"
@@ -1493,13 +1693,15 @@ export default function WorkbenchPanel() {
                 setSelMode(m);
               }}
               title={
-                m === 'point'
-                  ? 'nearest corner of the clicked part (smooth solids have no corners - rims are edges)'
-                  : m === 'edge'
-                    ? 'nearest edge of the clicked part (incl. rims)'
-                    : m === 'face'
-                      ? 'the clicked FACE of the part (its center + outward normal)'
-                      : 'the whole part'
+                m === 'auto'
+                  ? 'snap to the closest feature under the cursor (corner > edge > face); hover previews what a click will grab'
+                  : m === 'point'
+                    ? 'nearest corner of the clicked part (smooth solids have no corners - rims are edges)'
+                    : m === 'edge'
+                      ? 'nearest edge of the clicked part (incl. rims)'
+                      : m === 'face'
+                        ? 'the clicked FACE of the part (its center + outward normal)'
+                        : 'the whole part'
               }
               className={
                 'rounded px-2 py-0.5 ' +
