@@ -284,6 +284,9 @@ export default function WorkbenchPanel() {
   // when set, the panel is in "pick a face to mount this fold" mode: the next
   // face click on another part fires mate_to_face (erecting accordion)
   const [mateFrom, setMateFrom] = useState<string | null>(null);
+  // the mate glyph currently selected in the viewport (its glTF extras):
+  // drives the mate editor in the edit pane
+  const [selectedMate, setSelectedMate] = useState<any>(null);
   const [status, setStatus] = useState('Load a .gltf (truss: pack --out writes packed.gltf)');
   // feedback widget: shown after a tool publishes geometry; the
   // model-independent channel that calibrates the in-band record_feedback
@@ -610,6 +613,26 @@ export default function WorkbenchPanel() {
       noteToComposer(
         `[workbench: mounted ${child} to ${target}.${face} as an erecting ` +
           `accordion - stows flat, deploys out along the face normal]`,
+      );
+    }
+  }
+
+  // edit the selected mate (type / standoff) through the engine and re-verify
+  async function applyMate(fields: { mate_type?: string; offset_m?: number }) {
+    if (!selectedMate) {
+      return;
+    }
+    setBusyOp('setmate');
+    const r = await opPost('set_mate', { child: selectedMate.child, ...fields });
+    setBusyOp('');
+    setOpStatus(r.text.split('\n')[0]);
+    if (r.ok) {
+      setSelectedMate({ ...selectedMate, ...fields }); // optimistic until reload
+      noteToComposer(
+        `[workbench: set ${selectedMate.child}'s mate` +
+          (fields.mate_type ? ` type=${fields.mate_type}` : '') +
+          (fields.offset_m != null ? ` offset=${fields.offset_m} m` : '') +
+          ']',
       );
     }
   }
@@ -1562,6 +1585,16 @@ export default function WorkbenchPanel() {
       }
       return;
     }
+    // a mate glyph selects the JOIN, not a part: open its editor
+    const hitNode = resolveHit(ev);
+    if (hitNode?.node?.userData?.kind === 'mate') {
+      setSelectedMate(hitNode.node.userData);
+      setMode('edit');
+      setPicks([]);
+      rebuildOverlay([]);
+      return;
+    }
+    setSelectedMate(null);
     const append = ev.ctrlKey || ev.shiftKey || ev.metaKey;
     const rec = resolvePick(ev);
     if (!rec) {
@@ -2341,7 +2374,78 @@ export default function WorkbenchPanel() {
                 </button>
               ))}
             </div>
-            {!editTarget ? (
+            {selectedMate ? (
+              <div className="flex flex-col gap-1.5" data-testid="wb-mate-editor">
+                <div className="flex items-center gap-1">
+                  <span
+                    className="inline-block h-2 w-2 flex-shrink-0 rounded-sm"
+                    style={{ background: '#f97316' }}
+                  />
+                  <span className="mr-auto font-semibold">mate</span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMate(null)}
+                    className="rounded px-1.5 py-0.5 text-text-secondary hover:bg-surface-hover"
+                  >
+                    close
+                  </button>
+                </div>
+                <span className="truncate font-mono text-[11px] text-text-secondary">
+                  {selectedMate.child}.{selectedMate.this} →{' '}
+                  {selectedMate.parent}.{selectedMate.to}
+                </span>
+                <div className="flex items-center gap-1">
+                  <span className="min-w-0 flex-1">type</span>
+                  <select
+                    value={selectedMate.mate_type}
+                    disabled={busyOp !== ''}
+                    onChange={(e) => applyMate({ mate_type: e.target.value })}
+                    className="rounded border border-border-medium bg-transparent px-1 py-0.5"
+                    data-testid="wb-mate-type"
+                  >
+                    <option value="fastened">fastened</option>
+                    <option value="revolute">revolute</option>
+                    <option value="slider">slider</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="min-w-0 flex-1 font-mono">offset_m</span>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    value={String(selectedMate.offset_m ?? 0)}
+                    onChange={(e) =>
+                      setSelectedMate({
+                        ...selectedMate,
+                        offset_m: parseFloat(e.target.value),
+                      })
+                    }
+                    onKeyDown={(e) =>
+                      e.key === 'Enter' &&
+                      applyMate({ offset_m: parseFloat((e.target as HTMLInputElement).value) })
+                    }
+                    className="w-20 rounded border border-border-medium bg-transparent px-1 py-0.5 font-mono"
+                    data-testid="wb-mate-offset"
+                  />
+                  <button
+                    type="button"
+                    disabled={busyOp !== ''}
+                    onClick={() => applyMate({ offset_m: selectedMate.offset_m })}
+                    className="rounded bg-surface-secondary px-1.5 py-0.5 hover:bg-surface-hover disabled:opacity-50"
+                  >
+                    {busyOp === 'setmate' ? '…' : 'set'}
+                  </button>
+                </div>
+                <span className="text-[10px] text-text-secondary">
+                  editing the join re-verifies through the engine; to retarget,
+                  use a part's “mate to face”, and to remove it delete the part
+                </span>
+                {opStatus && (
+                  <span className="text-[10px] text-text-secondary">{opStatus}</span>
+                )}
+              </div>
+            ) : !editTarget ? (
               <span className="text-text-secondary">
                 pick a part in the viewport to edit or delete it, or add one
                 above - every edit re-verifies through the engine, nothing is
