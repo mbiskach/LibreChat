@@ -1,0 +1,12 @@
+include:
+  - project: "fast/templates"
+    file: "v1/FAST-DevOps.gitlab-ci.yml"
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_FORCE_HTTPS: "true"
+
+stages:
+  - build
+  - test
+  - deploy
