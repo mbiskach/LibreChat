@@ -21,3 +21,29 @@ export function sideChannelBase(): string {
   }
   return '/api/mcp/truss/side';
 }
+
+/**
+ * Wrap a fetch init with the auth the side-channel needs. In RELAY (proxy) mode
+ * the fetch goes through the LibreChat backend, whose route is `requireJwtAuth`
+ * (Bearer, `ExtractJwt.fromAuthHeaderAsBearerToken`); a raw `fetch` sends no
+ * Authorization header, so the proxy 401s and no geometry loads. Add the Bearer
+ * token here. In DIRECT mode (`truss_gltf_direct`) the loopback side-channel
+ * needs no auth, so leave the request untouched (and never send a cross-origin
+ * Authorization header, which would force a CORS preflight the side-channel
+ * doesn't answer).
+ */
+export function sideChannelInit(token?: string, init: RequestInit = {}): RequestInit {
+  try {
+    if (window.localStorage.getItem('truss_gltf_direct')) {
+      return init;
+    }
+  } catch {
+    /* localStorage unavailable: treat as proxy mode */
+  }
+  if (!token) {
+    return init;
+  }
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Bearer ${token}`);
+  return { ...init, headers };
+}
