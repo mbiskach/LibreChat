@@ -16,6 +16,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { useChatFormContext } from '~/Providers';
+import { sideChannelBase } from './sideChannel';
 
 type PickEntry = {
   ref: string;
@@ -354,8 +355,7 @@ export default function WorkbenchPanel() {
    * never authors geometry: every edit is a narrow spec operation the
    * engine re-verifies, identical to the model's tool path. */
   async function opPost(tool: string, args: Record<string, unknown>): Promise<any> {
-    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
-    const r = await fetch(`http://127.0.0.1:${port}/op`, {
+    const r = await fetch(`${sideChannelBase()}/op`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool, args }),
@@ -449,8 +449,7 @@ export default function WorkbenchPanel() {
     if (mode !== 'constraints' || corpus) {
       return;
     }
-    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
-    fetch(`http://127.0.0.1:${port}/corpus.json`)
+    fetch(`${sideChannelBase()}/corpus.json`)
       .then((r) => r.json())
       .then((j) => setCorpus(j.constraints ?? {}))
       .catch(() => setCorpus({}));
@@ -638,9 +637,8 @@ export default function WorkbenchPanel() {
   }
 
   async function sendFeedback(rating: number, comment?: string) {
-    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
     try {
-      await fetch(`http://127.0.0.1:${port}/feedback`, {
+      await fetch(`${sideChannelBase()}/feedback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rating, comment }),
@@ -672,12 +670,12 @@ export default function WorkbenchPanel() {
   // call publishes new geometry, the panel picks it up within ~3 s -
   // spike wiring; the production path is a message/artifact renderer hook
   useEffect(() => {
-    // dev override so a second tool instance (tests, demos) can feed the
-    // panel without disturbing the host-owned default channel
-    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
+    // same-origin proxy base by default; `truss_gltf_direct` in localStorage
+    // switches to a direct 127.0.0.1 connection for standalone-truss dev
+    const base = sideChannelBase();
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`http://127.0.0.1:${port}/latest.json`);
+        const r = await fetch(`${base}/latest.json`);
         if (!r.ok) {
           return;
         }

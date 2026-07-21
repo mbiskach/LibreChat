@@ -4,6 +4,7 @@ import { useRecoilState } from 'recoil';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 import { workbenchVisibleState } from './workbenchStore';
+import { sideChannelBase } from './sideChannel';
 
 /** Header button: opens the Spatial Workbench in the wide split. */
 export default function WorkbenchToggle() {
@@ -16,12 +17,12 @@ export default function WorkbenchToggle() {
   // geometry is published (a fresh tool call) - geometry that existed
   // before the page loaded does not pop the panel uninvited
   useEffect(() => {
-    const port = window.localStorage.getItem('truss_gltf_port') ?? '8714';
+    const base = sideChannelBase();
     let last: number | null = null;
     let sawEmpty = false;
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`http://127.0.0.1:${port}/latest.json`);
+        const r = await fetch(`${base}/latest.json`);
         if (!r.ok) {
           return;
         }

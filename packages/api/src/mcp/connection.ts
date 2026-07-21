@@ -1,4 +1,4 @@
-import { isIP } from 'node:net';
+import { isIP, createServer } from 'node:net';
 import { EventEmitter } from 'events';
 import { logger } from '@librechat/data-schemas';
 import { fetch as undiciFetch, Agent, ProxyAgent } from 'undici';
@@ -75,6 +75,46 @@ type MCPProxyConfig =
 
 function isStdioOptions(options: t.MCPOptions): options is t.StdioOptions {
   return 'command' in options;
+}
+
+/**
+ * Names of stdio MCP servers that expose an out-of-band loopback HTTP
+ * "side-channel" the LibreChat backend reverse-proxies to the browser
+ * (see `api/server/routes/mcp.js` — `/:serverName/side/*`). For these, the
+ * backend pre-allocates a free loopback port and injects it into the child
+ * process env so the side-channel binds a per-user port the proxy can find,
+ * and tells the child to emit same-origin relative geometry URLs. Scoped by
+ * name so no other stdio MCP server's behavior changes.
+ */
+const SIDE_CHANNEL_STDIO_SERVERS = new Set(['truss']);
+
+/**
+ * Allocates a free loopback TCP port by binding an ephemeral listener and
+ * immediately releasing it. There is an inherent TOCTOU window between
+ * release and the child process re-binding the port; it is small and the
+ * loopback interface is single-tenant here, so this is acceptable. The
+ * alternative (spawn with port 0 and parse the child's `gltf_port=<n>`
+ * stderr line) is available but awkward given the SDK owns the transport's
+ * stdio streams, so pre-allocation is preferred.
+ */
+function allocateFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      srv.close((closeErr) => {
+        if (closeErr) {
+          reject(closeErr);
+        } else if (port) {
+          resolve(port);
+        } else {
+          reject(new Error('Failed to allocate a free side-channel port'));
+        }
+      });
+    });
+  });
 }
 
 function isWebSocketOptions(options: t.MCPOptions): options is t.WebSocketOptions {
@@ -1150,6 +1190,14 @@ export class MCPConnection extends EventEmitter {
   timeout?: number;
   sseReadTimeout?: number;
   url?: string;
+  /**
+   * Loopback port of this connection's out-of-band HTTP side-channel, if the
+   * server exposes one (see SIDE_CHANNEL_STDIO_SERVERS). Set at spawn time and
+   * read by the `/:serverName/side/*` reverse-proxy route to locate the
+   * per-user child's geometry/workbench HTTP server. Undefined for every other
+   * server/transport.
+   */
+  public sideChannelPort?: number;
 
   /**
    * Timestamp when this connection was created.
@@ -1545,17 +1593,35 @@ export class MCPConnection extends EventEmitter {
       }
 
       switch (type) {
-        case 'stdio':
+        case 'stdio': {
           if (!isStdioOptions(options)) {
             throw new Error('Invalid options for stdio transport.');
+          }
+          // workaround bug of mcp sdk that can't pass env:
+          // https://github.com/modelcontextprotocol/typescript-sdk/issues/216
+          const stdioEnv: Record<string, string> = {
+            ...getDefaultEnvironment(),
+            ...(options.env ?? {}),
+          };
+          // Side-channel servers (e.g. truss): allocate a per-user loopback
+          // port for the child's embedded HTTP geometry/workbench server and
+          // point its emitted geometry URLs at the same-origin reverse-proxy
+          // route, so the browser never has to reach 127.0.0.1 directly.
+          if (SIDE_CHANNEL_STDIO_SERVERS.has(this.serverName)) {
+            const port = await allocateFreePort();
+            this.sideChannelPort = port;
+            stdioEnv.TRUSS_GLTF_PORT = String(port);
+            stdioEnv.TRUSS_GLTF_BASE_URL = `/api/mcp/${this.serverName}/side`;
+            logger.info(
+              `${this.getLogPrefix()} Allocated side-channel port ${port} (base /api/mcp/${this.serverName}/side)`,
+            );
           }
           return new StdioClientTransport({
             command: options.command,
             args: options.args,
-            // workaround bug of mcp sdk that can't pass env:
-            // https://github.com/modelcontextprotocol/typescript-sdk/issues/216
-            env: { ...getDefaultEnvironment(), ...(options.env ?? {}) },
+            env: stdioEnv,
           });
+        }
 
         case 'websocket': {
           if (!isWebSocketOptions(options)) {
