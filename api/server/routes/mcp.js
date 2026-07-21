@@ -1,3 +1,4 @@
+const http = require('node:http');
 const { Router } = require('express');
 const { logger, getTenantId, tenantStorage } = require('@librechat/data-schemas');
 const {
@@ -977,5 +978,127 @@ router.delete(
   }),
   deleteMCPServerController,
 );
+
+/**
+ * Reverse-proxy for an MCP server's out-of-band loopback HTTP "side-channel".
+ *
+ * Some stdio MCP servers (e.g. `truss`) run an embedded, unauthenticated HTTP
+ * server on 127.0.0.1 alongside the stdio protocol to serve 3D geometry and
+ * drive the Spatial Workbench widget. That loopback address is never reachable
+ * from a remote browser (and must not be exposed). This route lets the browser
+ * reach it through the authenticated LibreChat backend on the same origin:
+ *
+ *   Browser → GET/POST /api/mcp/:serverName/side/<subpath>   (JWT-authed)
+ *     → http://127.0.0.1:<per-user side-channel port>/<subpath>   (loopback)
+ *
+ * The per-user port is allocated by the backend at spawn time and recorded on
+ * the user's MCPConnection (`connection.sideChannelPort`, see
+ * packages/api/src/mcp/connection.ts). We resolve it strictly from the
+ * AUTHENTICATED user's own connection map, so one user can never reach another
+ * user's child process.
+ *
+ * NOTE on auth: we use `requireJwtAuth` + `checkMCPUsePermissions` rather than
+ * `canAccessMCPServerResource`. The latter resolves the server name against a
+ * MongoDB record (`findMCPServerByServerName`) and 404s for config-file MCP
+ * servers like `truss` (defined in librechat.yaml, no DB row). The USE-
+ * permission gate is the pattern the config-server routes here already use
+ * (see `/:serverName/reinitialize`), and geometry + `/op` mutations stay
+ * behind the user's session either way.
+ */
+const proxySideChannel = (req, res) => {
+  const { serverName } = req.params;
+  const user = req.user;
+
+  if (!user?.id) {
+    return res.status(401).json({ error: 'User not authenticated' });
+  }
+
+  // Two topologies (truss docs/mcp_relay.md):
+  //  - PRODUCTION (stdio, per-user): the spawned subprocess exposes its OWN
+  //    loopback port on the connection -> per-user isolation.
+  //  - BENCH/DEV: a single shared truss runs on the HOST (streamable-http via
+  //    mcp-proxy), so there is no per-user stdio port. TRUSS_SIDE_CHANNEL_HOST /
+  //    TRUSS_SIDE_CHANNEL_PORT point the proxy at it (e.g. host.docker.internal
+  //    :8714). Opt-in: unset in production, so the per-user sideChannelPort path
+  //    stays authoritative.
+  let host = '127.0.0.1';
+  let port;
+  if (process.env.TRUSS_SIDE_CHANNEL_PORT) {
+    host = process.env.TRUSS_SIDE_CHANNEL_HOST || '127.0.0.1';
+    port = Number(process.env.TRUSS_SIDE_CHANNEL_PORT);
+  } else {
+    const mcpManager = getMCPManager();
+    const userConnections = mcpManager.getUserConnections?.(user.id);
+    const connection = userConnections?.get(serverName);
+    port = connection?.sideChannelPort;
+  }
+
+  if (!port) {
+    return res.status(503).json({
+      error: `MCP server '${serverName}' side-channel is not available for this user`,
+    });
+  }
+
+  /** `*splat` param is an array of the decoded path segments after `/side/`. */
+  const splat = req.params.splat;
+  const subPath = Array.isArray(splat) ? splat.join('/') : (splat ?? '');
+  const queryIndex = req.originalUrl.indexOf('?');
+  const search = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';
+  const targetPath = `/${subPath}${search}`;
+
+  /** Only forward the headers the side-channel cares about. */
+  const forwardHeaders = {};
+  if (req.headers['accept']) {
+    forwardHeaders['accept'] = req.headers['accept'];
+  }
+
+  const isBodyMethod = req.method !== 'GET' && req.method !== 'HEAD';
+  /**
+   * Global `express.json()` has already consumed and parsed the request
+   * stream, so the raw body cannot be piped — re-serialize the parsed body
+   * for POSTs (`/op`, `/feedback`). The side-channel expects JSON.
+   */
+  let bodyBuffer = null;
+  if (isBodyMethod) {
+    bodyBuffer = Buffer.from(JSON.stringify(req.body ?? {}));
+    forwardHeaders['content-type'] = 'application/json';
+    forwardHeaders['content-length'] = Buffer.byteLength(bodyBuffer);
+  }
+
+  const upstream = http.request(
+    { host, port, method: req.method, path: targetPath, headers: forwardHeaders },
+    (upstreamRes) => {
+      res.status(upstreamRes.statusCode || 502);
+      const contentType = upstreamRes.headers['content-type'];
+      if (contentType) {
+        res.setHeader('Content-Type', contentType);
+      }
+      const contentLength = upstreamRes.headers['content-length'];
+      if (contentLength) {
+        res.setHeader('Content-Length', contentLength);
+      }
+      /** Stream the response through (glTF payloads can be ~1 MB). */
+      upstreamRes.pipe(res);
+    },
+  );
+
+  upstream.on('error', (error) => {
+    logger.error(`[MCP Side-Channel] Proxy error for '${serverName}' → ${targetPath}`, error);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Side-channel proxy error' });
+    } else {
+      res.end();
+    }
+  });
+
+  if (bodyBuffer) {
+    upstream.end(bodyBuffer);
+  } else {
+    upstream.end();
+  }
+};
+
+router.get('/:serverName/side/*splat', requireJwtAuth, checkMCPUsePermissions, proxySideChannel);
+router.post('/:serverName/side/*splat', requireJwtAuth, checkMCPUsePermissions, proxySideChannel);
 
 module.exports = router;
