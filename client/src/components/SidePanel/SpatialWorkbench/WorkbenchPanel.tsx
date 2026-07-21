@@ -16,7 +16,8 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { useChatFormContext } from '~/Providers';
-import { sideChannelBase } from './sideChannel';
+import { useAuthContext } from '~/hooks/AuthContext';
+import { sideChannelBase, sideChannelInit } from './sideChannel';
 
 type PickEntry = {
   ref: string;
@@ -278,6 +279,11 @@ function autoPick(
 export default function WorkbenchPanel() {
   const mountRef = useRef<HTMLDivElement>(null);
   const ctx = useRef<any>({});
+  // the relay proxy is JWT-authed; keep the current token in a ref so the poll
+  // interval + edit posts always send a fresh Bearer (tokens rotate on refresh).
+  const { token } = useAuthContext();
+  const tokenRef = useRef<string | undefined>(token);
+  tokenRef.current = token;
   const [scenes, setScenes] = useState<string[]>([]);
   const [active, setActive] = useState('');
   const [picks, setPicks] = useState<PickEntry[]>([]);
@@ -355,11 +361,11 @@ export default function WorkbenchPanel() {
    * never authors geometry: every edit is a narrow spec operation the
    * engine re-verifies, identical to the model's tool path. */
   async function opPost(tool: string, args: Record<string, unknown>): Promise<any> {
-    const r = await fetch(`${sideChannelBase()}/op`, {
+    const r = await fetch(`${sideChannelBase()}/op`, sideChannelInit(tokenRef.current, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool, args }),
-    });
+    }));
     return r.json();
   }
 
@@ -449,7 +455,7 @@ export default function WorkbenchPanel() {
     if (mode !== 'constraints' || corpus) {
       return;
     }
-    fetch(`${sideChannelBase()}/corpus.json`)
+    fetch(`${sideChannelBase()}/corpus.json`, sideChannelInit(tokenRef.current))
       .then((r) => r.json())
       .then((j) => setCorpus(j.constraints ?? {}))
       .catch(() => setCorpus({}));
@@ -638,11 +644,11 @@ export default function WorkbenchPanel() {
 
   async function sendFeedback(rating: number, comment?: string) {
     try {
-      await fetch(`${sideChannelBase()}/feedback`, {
+      await fetch(`${sideChannelBase()}/feedback`, sideChannelInit(tokenRef.current, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rating, comment }),
-      });
+      }));
     } catch {
       /* corpus is best-effort */
     }
@@ -675,14 +681,14 @@ export default function WorkbenchPanel() {
     const base = sideChannelBase();
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`${base}/latest.json`);
+        const r = await fetch(`${base}/latest.json`, sideChannelInit(tokenRef.current));
         if (!r.ok) {
           return;
         }
         const j = await r.json();
         if (j.stamp && j.stamp !== ctx.current.lastStamp) {
           ctx.current.lastStamp = j.stamp;
-          const g = await fetch(j.url);
+          const g = await fetch(j.url, sideChannelInit(tokenRef.current));
           loadText(`${j.spec_name} (${j.verdict})`, await g.text());
           setRated('');
           setWhy('');
@@ -693,7 +699,7 @@ export default function WorkbenchPanel() {
           // stays small; older servers just have no constraints data
           if (j.findings_url) {
             try {
-              const fr = await fetch(j.findings_url);
+              const fr = await fetch(j.findings_url, sideChannelInit(tokenRef.current));
               const fd = await fr.json();
               setFindings(fd.findings ?? []);
             } catch {

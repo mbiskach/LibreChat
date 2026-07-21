@@ -1,16 +1,22 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Boxes } from 'lucide-react';
 import { useRecoilState } from 'recoil';
 import { useLocalize } from '~/hooks';
+import { useAuthContext } from '~/hooks/AuthContext';
 import { cn } from '~/utils';
 import { workbenchVisibleState } from './workbenchStore';
-import { sideChannelBase } from './sideChannel';
+import { sideChannelBase, sideChannelInit } from './sideChannel';
 
 /** Header button: opens the Spatial Workbench in the wide split. */
 export default function WorkbenchToggle() {
   const localize = useLocalize();
   const [visible, setVisible] = useRecoilState(workbenchVisibleState);
   const label = localize('com_sidepanel_workbench');
+  // the relay proxy is JWT-authed; keep the latest token in a ref so the poll
+  // interval always sends a fresh Bearer (tokens rotate on refresh).
+  const { token } = useAuthContext();
+  const tokenRef = useRef<string | undefined>(token);
+  tokenRef.current = token;
 
   // auto-open: this button is always mounted in a conversation, so it
   // watches the tool side-channel and opens the workbench when NEW
@@ -22,7 +28,7 @@ export default function WorkbenchToggle() {
     let sawEmpty = false;
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`${base}/latest.json`);
+        const r = await fetch(`${base}/latest.json`, sideChannelInit(tokenRef.current));
         if (!r.ok) {
           return;
         }
