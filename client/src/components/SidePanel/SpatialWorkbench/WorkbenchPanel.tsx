@@ -426,6 +426,30 @@ export default function WorkbenchPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, active, scenes.length]);
 
+  // Download a STEP file THROUGH the authed relay. A plain <a href download>
+  // is a browser navigation, which does not carry the JWT Bearer, so it 401s
+  // through the proxy in cloud. Fetch it with auth (same-origin) or directly
+  // (cross-origin loopback), then hand the browser a blob object URL.
+  async function downloadStep(l: { name: string; url: string }) {
+    try {
+      const r = await sideChannelFetch(l.url, tokenRef.current);
+      if (!r.ok) {
+        setStatus(`STEP download failed (${r.status})`);
+        return;
+      }
+      const obj = URL.createObjectURL(await r.blob());
+      const a = document.createElement('a');
+      a.href = obj;
+      a.download = l.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(obj);
+    } catch {
+      setStatus('STEP download failed');
+    }
+  }
+
   async function exportStep() {
     setExporting(true);
     setStepLinks([]);
@@ -1781,16 +1805,16 @@ export default function WorkbenchPanel() {
       )}
       {stepLinks.length > 0 && (
         <div className="rounded-md border border-border-medium p-1.5 text-xs" data-testid="wb-step-links">
-          <div className="text-text-secondary">STEP files (right-click → save):</div>
+          <div className="text-text-secondary">STEP files (click to download):</div>
           {stepLinks.map((l) => (
-            <a
+            <button
               key={l.url}
-              href={l.url}
-              download={l.name}
-              className="block truncate font-mono text-[11px] text-blue-500 hover:underline"
+              type="button"
+              onClick={() => downloadStep(l)}
+              className="block w-full truncate text-left font-mono text-[11px] text-blue-500 hover:underline"
             >
               {l.name} ({l.kb} KB)
-            </a>
+            </button>
           ))}
         </div>
       )}
