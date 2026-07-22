@@ -678,6 +678,19 @@ export default function WorkbenchPanel() {
     }
   }
 
+  // Submit one round of feedback, flash the ✓ confirmation, then reset the
+  // widget so more rounds can be filed against the same geometry (a session
+  // often surfaces several distinct issues in one configuration).
+  function submitFeedback(rating: number, comment?: string) {
+    sendFeedback(rating, comment);
+    setWhy('');
+    setRated('sent');
+    if (ctx.current.ratedTimer) {
+      clearTimeout(ctx.current.ratedTimer);
+    }
+    ctx.current.ratedTimer = setTimeout(() => setRated(''), 1500);
+  }
+
   useEffect(() => {
     return () => {
       const c = ctx.current;
@@ -686,6 +699,9 @@ export default function WorkbenchPanel() {
       }
       if (c.playRaf) {
         cancelAnimationFrame(c.playRaf);
+      }
+      if (c.ratedTimer) {
+        clearTimeout(c.ratedTimer);
       }
       if (c.renderer) {
         c.renderer.dispose();
@@ -1829,10 +1845,7 @@ export default function WorkbenchPanel() {
                   aria-label="that did what I meant"
                   title="that did what I meant"
                   className="rounded px-1 hover:bg-surface-hover"
-                  onClick={() => {
-                    sendFeedback(1);
-                    setRated('sent');
-                  }}
+                  onClick={() => submitFeedback(1)}
                 >
                   👍
                 </button>
@@ -1853,8 +1866,7 @@ export default function WorkbenchPanel() {
                 onChange={(e) => setWhy(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    sendFeedback(-1, why);
-                    setRated('sent');
+                    submitFeedback(-1, why);
                   }
                 }}
                 placeholder="what went wrong? (Enter)"
@@ -1917,7 +1929,6 @@ export default function WorkbenchPanel() {
               {m}
             </button>
           ))}
-          <span className="text-text-secondary">· ctrl-click adds · double-click → chat</span>
           {mentionCount > 0 && (
             <span className="text-amber-500" title="geometry the reply refers to is outlined in amber">
               · {mentionCount} in reply
@@ -2291,7 +2302,7 @@ export default function WorkbenchPanel() {
               })()}
             </div>
             <span className="text-[10px] text-text-secondary">
-              click a finding to outline its parts · WARN = placeholder data
+              click a finding to outline its parts
             </span>
           </div>
         )}
@@ -2306,9 +2317,6 @@ export default function WorkbenchPanel() {
               </span>
             ) : (
               <>
-                <span className="text-text-secondary">
-                  steps (click to jump the scrubber):
-                </span>
                 <div className="min-h-0 flex-1 overflow-y-auto" data-testid="wb-deploy-steps">
                   {steps.map((s, i) => {
                     const stepActive = deployT >= s.w0 - 1e-6 && deployT <= s.w1 + 1e-6;
@@ -2361,9 +2369,6 @@ export default function WorkbenchPanel() {
                     );
                   })}
                 </div>
-                <span className="text-[10px] text-text-secondary">
-                  scrubber + clearance strip are under the view
-                </span>
               </>
             )}
           </div>
@@ -2600,10 +2605,6 @@ export default function WorkbenchPanel() {
                     {opStatus}
                   </span>
                 )}
-                <span className="text-[10px] text-text-secondary">
-                  edits are spec operations the engine re-verifies - same
-                  verbs the assistant uses
-                </span>
               </>
             )}
           </div>
