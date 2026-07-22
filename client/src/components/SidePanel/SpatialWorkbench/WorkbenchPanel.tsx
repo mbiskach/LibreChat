@@ -17,7 +17,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useChatFormContext } from '~/Providers';
 import { useAuthContext } from '~/hooks/AuthContext';
-import { sideChannelBase, sideChannelInit } from './sideChannel';
+import { sideChannelBase, sideChannelFetch } from './sideChannel';
 
 type PickEntry = {
   ref: string;
@@ -361,11 +361,11 @@ export default function WorkbenchPanel() {
    * never authors geometry: every edit is a narrow spec operation the
    * engine re-verifies, identical to the model's tool path. */
   async function opPost(tool: string, args: Record<string, unknown>): Promise<any> {
-    const r = await fetch(`${sideChannelBase()}/op`, sideChannelInit(tokenRef.current, {
+    const r = await sideChannelFetch(`${sideChannelBase()}/op`, tokenRef.current, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool, args }),
-    }));
+    });
     return r.json();
   }
 
@@ -455,7 +455,7 @@ export default function WorkbenchPanel() {
     if (mode !== 'constraints' || corpus) {
       return;
     }
-    fetch(`${sideChannelBase()}/corpus.json`, sideChannelInit(tokenRef.current))
+    sideChannelFetch(`${sideChannelBase()}/corpus.json`, tokenRef.current)
       .then((r) => r.json())
       .then((j) => setCorpus(j.constraints ?? {}))
       .catch(() => setCorpus({}));
@@ -644,11 +644,11 @@ export default function WorkbenchPanel() {
 
   async function sendFeedback(rating: number, comment?: string) {
     try {
-      await fetch(`${sideChannelBase()}/feedback`, sideChannelInit(tokenRef.current, {
+      await sideChannelFetch(`${sideChannelBase()}/feedback`, tokenRef.current, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rating, comment }),
-      }));
+      });
     } catch {
       /* corpus is best-effort */
     }
@@ -681,14 +681,14 @@ export default function WorkbenchPanel() {
     const base = sideChannelBase();
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`${base}/latest.json`, sideChannelInit(tokenRef.current));
+        const r = await sideChannelFetch(`${base}/latest.json`, tokenRef.current);
         if (!r.ok) {
           return;
         }
         const j = await r.json();
         if (j.stamp && j.stamp !== ctx.current.lastStamp) {
           ctx.current.lastStamp = j.stamp;
-          const g = await fetch(j.url, sideChannelInit(tokenRef.current));
+          const g = await sideChannelFetch(j.url, tokenRef.current);
           loadText(`${j.spec_name} (${j.verdict})`, await g.text());
           setRated('');
           setWhy('');
@@ -699,7 +699,7 @@ export default function WorkbenchPanel() {
           // stays small; older servers just have no constraints data
           if (j.findings_url) {
             try {
-              const fr = await fetch(j.findings_url, sideChannelInit(tokenRef.current));
+              const fr = await sideChannelFetch(j.findings_url, tokenRef.current);
               const fd = await fr.json();
               setFindings(fd.findings ?? []);
             } catch {

@@ -5,7 +5,7 @@ import { useLocalize } from '~/hooks';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { cn } from '~/utils';
 import { workbenchVisibleState } from './workbenchStore';
-import { sideChannelBase, sideChannelInit } from './sideChannel';
+import { sideChannelBase, sideChannelFetch } from './sideChannel';
 
 /** Header button: opens the Spatial Workbench in the wide split. */
 export default function WorkbenchToggle() {
@@ -28,7 +28,7 @@ export default function WorkbenchToggle() {
     let sawEmpty = false;
     const iv = setInterval(async () => {
       try {
-        const r = await fetch(`${base}/latest.json`, sideChannelInit(tokenRef.current));
+        const r = await sideChannelFetch(`${base}/latest.json`, tokenRef.current);
         if (!r.ok) {
           return;
         }
