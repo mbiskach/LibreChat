@@ -2364,17 +2364,6 @@ export default function WorkbenchPanel() {
                 <span className="text-[10px] text-text-secondary">
                   scrubber + clearance strip are under the view
                 </span>
-                {steps.some((s) =>
-                  (s.members ?? [s.component]).some((c: string) => /_p\d\d$/.test(c)),
-                ) && (
-                  <span className="rounded bg-amber-500/10 px-1.5 py-1 text-[10px] text-amber-500/90">
-                    accordion note: a Z-fold's panels graze in lockstep as it
-                    opens, so a step may read 0 m. Real blankets are pulled taut
-                    on an extending boom and never actually touch — this
-                    rigid-panel model shows that as a controlled graze, not a
-                    collision.
-                  </span>
-                )}
               </>
             )}
           </div>
