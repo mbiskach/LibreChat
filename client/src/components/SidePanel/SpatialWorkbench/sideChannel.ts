@@ -23,27 +23,30 @@ export function sideChannelBase(): string {
 }
 
 /**
- * Wrap a fetch init with the auth the side-channel needs. In RELAY (proxy) mode
- * the fetch goes through the LibreChat backend, whose route is `requireJwtAuth`
- * (Bearer, `ExtractJwt.fromAuthHeaderAsBearerToken`); a raw `fetch` sends no
- * Authorization header, so the proxy 401s and no geometry loads. Add the Bearer
- * token here. In DIRECT mode (`truss_gltf_direct`) the loopback side-channel
- * needs no auth, so leave the request untouched (and never send a cross-origin
- * Authorization header, which would force a CORS preflight the side-channel
- * doesn't answer).
+ * fetch() a side-channel URL with the right auth.
+ *
+ * The relay proxy is `requireJwtAuth` (Bearer,
+ * `ExtractJwt.fromAuthHeaderAsBearerToken`), so a proxied (same-origin) request
+ * MUST carry the JWT or it 401s and no geometry loads. But the Authorization
+ * header is attached ONLY for SAME-ORIGIN URLs: a cross-origin absolute URL
+ * (e.g. direct `http://127.0.0.1:8714/...`) must not carry it, or the browser
+ * fires a CORS preflight the loopback side-channel does not allow. Deciding by
+ * the URL's origin (not a mode flag) keeps every combination correct, including
+ * a mixed setup where `latest.json` comes via the proxy but its `url` is an
+ * absolute direct link.
  */
-export function sideChannelInit(token?: string, init: RequestInit = {}): RequestInit {
-  try {
-    if (window.localStorage.getItem('truss_gltf_direct')) {
-      return init;
-    }
-  } catch {
-    /* localStorage unavailable: treat as proxy mode */
+export function sideChannelFetch(
+  url: string,
+  token?: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const sameOrigin =
+    url.startsWith('/') ||
+    (typeof window !== 'undefined' && url.startsWith(window.location.origin));
+  if (token && sameOrigin) {
+    const headers = new Headers(init.headers);
+    headers.set('Authorization', `Bearer ${token}`);
+    return fetch(url, { ...init, headers });
   }
-  if (!token) {
-    return init;
-  }
-  const headers = new Headers(init.headers);
-  headers.set('Authorization', `Bearer ${token}`);
-  return { ...init, headers };
+  return fetch(url, init);
 }
