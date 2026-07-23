@@ -1044,7 +1044,12 @@ const proxySideChannel = (req, res) => {
   const subPath = Array.isArray(splat) ? splat.join('/') : (splat ?? '');
   const queryIndex = req.originalUrl.indexOf('?');
   const search = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';
-  const targetPath = `/${subPath}${search}`;
+  // Per-user isolation: prepend the AUTHENTICATED user id as the workspace
+  // key, so the side-channel server serves THIS user's geometry. The key must
+  // come from the session, never from the client's path — otherwise a user
+  // could read another's designs by requesting /side/<other-id>/latest.json.
+  const workspace = encodeURIComponent(String(user.id));
+  const targetPath = `/${workspace}/${subPath}${search}`;
 
   /** Only forward the headers the side-channel cares about. */
   const forwardHeaders = {};
