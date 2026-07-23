@@ -519,6 +519,13 @@ Please follow these instructions when using tools from the respective MCP server
           params: {
             name: toolName,
             arguments: toolArguments,
+            // Per-user isolation for the truss side-channel server: pass the
+            // authenticated user id so truss keys its design state by it (see
+            // truss mcp_http._current_key). Scoped to 'truss' so we never leak
+            // the user id to arbitrary third-party MCP servers.
+            ...(userId && serverName === 'truss'
+              ? { _meta: { user_id: userId } }
+              : {}),
           },
         },
         CallToolResultSchema,
